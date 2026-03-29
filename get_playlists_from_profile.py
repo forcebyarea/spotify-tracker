@@ -10,7 +10,7 @@ from google.oauth2.service_account import Credentials
 #  SETTINGS — edit these
 # ============================================================
 
-SPREADSHEET_ID = "YOUR_GOOGLE_SHEET_ID_HERE"
+SPREADSHEET_ID = "1dIjl5darXJ678ftBALLK-vqWkXopWRryvUlPGRdLJ9Q"
 # Same Sheet ID as your scraper.py
 
 PROFILE_DUMP_SHEET = "profile link dump"

@@ -2,12 +2,8 @@ name: Daily Spotify Tracker
 
 on:
   schedule:
-    # Runs scraper every day at 3:00 AM UTC (8:30 AM IST)
-    - cron: "0 3 * * *"
-
-    # Runs playlist discoverer every Sunday to pick up new playlists
-    - cron: "0 2 * * 0"
-
+    - cron: "0 3 * * *"   # daily at 3:00 AM UTC = 8:30 AM IST
+    - cron: "0 2 * * 0"   # every Sunday at 2:00 AM UTC = discover new playlists
   workflow_dispatch:
     inputs:
       run_discoverer:
@@ -17,9 +13,8 @@ on:
 
 jobs:
   discover:
-    # Runs on Sundays OR when manually triggered with run_discoverer=yes
-    if: github.event.schedule == '0 2 * * 0' || github.event.inputs.run_discoverer == 'yes'
     runs-on: ubuntu-latest
+    if: github.event.schedule == '0 2 * * 0' || github.event.inputs.run_discoverer == 'yes'
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -33,11 +28,9 @@ jobs:
         run: python get_playlists_from_profile.py
 
   scrape:
-    # Runs daily — waits for discover to finish if it's running
-    if: github.event.schedule == '0 3 * * *' || github.event_name == 'workflow_dispatch'
-    needs: [discover]
-    if: always()  # run even if discover was skipped
     runs-on: ubuntu-latest
+    needs: discover
+    if: always()
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6

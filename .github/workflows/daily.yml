@@ -2,31 +2,50 @@ name: Daily Spotify Tracker
 
 on:
   schedule:
-    # Runs every day at 3:00 AM UTC = 8:30 AM India time
+    # Runs scraper every day at 3:00 AM UTC (8:30 AM IST)
     - cron: "0 3 * * *"
 
+    # Runs playlist discoverer every Sunday to pick up new playlists
+    - cron: "0 2 * * 0"
+
   workflow_dispatch:
+    inputs:
+      run_discoverer:
+        description: 'Also run playlist discoverer? (yes/no)'
+        required: false
+        default: 'no'
 
 jobs:
-  scrape:
+  discover:
+    # Runs on Sundays OR when manually triggered with run_discoverer=yes
+    if: github.event.schedule == '0 2 * * 0' || github.event.inputs.run_discoverer == 'yes'
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-
       - name: Install dependencies
         run: pip install -r requirements.txt
-
-      # ✅ THIS IS THE FIXED STEP
-      - name: Run Spotify scraper
-        run: python scraper.py
+      - name: Discover playlists from profiles
         env:
-          SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
-          SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+        run: python get_playlists_from_profile.py
+
+  scrape:
+    # Runs daily — waits for discover to finish if it's running
+    if: github.event.schedule == '0 3 * * *' || github.event_name == 'workflow_dispatch'
+    needs: [discover]
+    if: always()  # run even if discover was skipped
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Scrape follower counts
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+        run: python scraper.py

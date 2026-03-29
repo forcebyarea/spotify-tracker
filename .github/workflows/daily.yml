@@ -27,7 +27,6 @@ jobs:
 
       - name: Run Spotify scraper
         env:
-        - name: Run scraper
 - name: Run scraper
   run: python scraper.py
   env:

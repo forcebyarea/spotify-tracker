@@ -11,7 +11,7 @@ from bs4 import BeautifulSoup
 #  SETTINGS — only edit this section
 # ============================================================
 
-SPREADSHEET_ID = "YOUR_GOOGLE_SHEET_ID_HERE"
+SPREADSHEET_ID = "1dIjl5darXJ678ftBALLK-vqWkXopWRryvUlPGRdLJ9Q"
 # How to find it: open your Google Sheet, look at the URL:
 # https://docs.google.com/spreadsheets/d/THIS_PART_HERE/edit
 # Copy the long string between /d/ and /edit

@@ -52,20 +52,33 @@ def connect_to_sheets():
 # ============================================================
 
 def get_spotify_token():
-    url = "https://open.spotify.com/get_access_token?reason=transport&productType=web_player"
+    print("   🔑 Fetching Spotify token...")
 
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0"
+        }
 
-    res = requests.get(url, headers=headers)
+        res = requests.get("https://open.spotify.com", headers=headers, timeout=15)
 
-    if res.status_code != 200:
-        print("❌ Failed to get token")
+        if res.status_code != 200:
+            print(f"❌ Failed to load Spotify page: {res.status_code}")
+            return None
+
+        # Extract access token from page
+        match = re.search(r'"accessToken":"(.*?)"', res.text)
+
+        if not match:
+            print("❌ Token not found in page")
+            return None
+
+        token = match.group(1)
+        print("   ✅ Token fetched")
+        return token
+
+    except Exception as e:
+        print(f"❌ Token error: {e}")
         return None
-
-    return res.json().get("accessToken")
-
 # ============================================================
 # GET URLS
 # ============================================================

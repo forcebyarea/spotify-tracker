@@ -12,7 +12,7 @@ from spotify_scraper import SpotifyClient
 # SETTINGS
 # ============================================================
 
-SPREADSHEET_ID = "1dIjl5darXJ678ftBALLK-vqWkXopWRryvUlPGRdLJ9Q"
+SPREADSHEET_ID = "YOUR_GOOGLE_SHEET_ID_HERE"
 PROFILE_DUMP_SHEET = "profile link dump"
 DELAY_BETWEEN_REQUESTS = 2
 
@@ -48,6 +48,25 @@ def connect_to_sheets():
     return spreadsheet
 
 # ============================================================
+# TOKEN (FIXES 401)
+# ============================================================
+
+def get_spotify_token():
+    url = "https://open.spotify.com/get_access_token?reason=transport&productType=web_player"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    res = requests.get(url, headers=headers)
+
+    if res.status_code != 200:
+        print("❌ Failed to get token")
+        return None
+
+    return res.json().get("accessToken")
+
+# ============================================================
 # GET URLS
 # ============================================================
 
@@ -64,14 +83,14 @@ def extract_user_id(url):
 # 🔥 FETCH ALL PLAYLISTS (UNLIMITED)
 # ============================================================
 
-def get_all_playlists(user_id):
+def get_all_playlists(user_id, token):
     print("   🔄 Fetching ALL playlists...")
 
     url = f"https://spclient.wg.spotify.com/user-profile-view/v3/profile/{user_id}/playlists"
 
     headers = {
+        "Authorization": f"Bearer {token}",
         "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json",
         "App-platform": "WebPlayer"
     }
 
@@ -82,35 +101,30 @@ def get_all_playlists(user_id):
     while True:
         params = {"offset": offset, "limit": limit}
 
-        try:
-            res = requests.get(url, headers=headers, params=params, timeout=15)
+        res = requests.get(url, headers=headers, params=params)
 
-            if res.status_code != 200:
-                print(f"   ❌ API error: {res.status_code}")
-                break
-
-            data = res.json()
-            items = data.get("public_playlists", [])
-
-            if not items:
-                break
-
-            for item in items:
-                uri = item.get("uri", "")
-                pid = uri.split(":")[-1] if uri else None
-
-                if pid:
-                    playlists.append({
-                        "name": item.get("name", "Unknown"),
-                        "url": f"https://open.spotify.com/playlist/{pid}"
-                    })
-
-            offset += limit
-            time.sleep(1)
-
-        except Exception as e:
-            print(f"   ❌ Error fetching playlists: {e}")
+        if res.status_code != 200:
+            print(f"   ❌ API error: {res.status_code}")
             break
+
+        data = res.json()
+        items = data.get("public_playlists", [])
+
+        if not items:
+            break
+
+        for item in items:
+            uri = item.get("uri", "")
+            pid = uri.split(":")[-1] if uri else None
+
+            if pid:
+                playlists.append({
+                    "name": item.get("name", "Unknown"),
+                    "url": f"https://open.spotify.com/playlist/{pid}"
+                })
+
+        offset += limit
+        time.sleep(1)
 
     print(f"   ✅ Total playlists found: {len(playlists)}")
     return playlists
@@ -128,11 +142,13 @@ def scrape_profile(profile_url, client):
 
     print(f"   🎵 Profile: {user_id}")
 
-    playlists = []
-    display_name = user_id
+    token = get_spotify_token()
+    if not token:
+        return None, []
 
-    # 🔥 Get ALL playlists
-    all_playlists = get_all_playlists(user_id)
+    all_playlists = get_all_playlists(user_id, token)
+
+    playlists = []
 
     for p in all_playlists:
         try:
@@ -156,7 +172,7 @@ def scrape_profile(profile_url, client):
         except Exception as e:
             print(f"      ⚠️ Error: {e}")
 
-    return display_name, playlists
+    return user_id, playlists
 
 # ============================================================
 # GOOGLE SHEETS WRITE
@@ -197,7 +213,7 @@ def update_followers_sheet(spreadsheet, profile_url, display_name, playlists):
 
 def main():
     print("=" * 50)
-    print("SPOTIFY TRACKER — FULL PLAYLIST MODE")
+    print("SPOTIFY TRACKER — FINAL VERSION")
     print("=" * 50)
 
     sheet = connect_to_sheets()

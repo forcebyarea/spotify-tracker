@@ -228,7 +228,7 @@ def main():
         print("❌ No URLs found. Exiting.")
         return
 
-    spotify_client = SpotifyClient(rate_limit_delay=DELAY_BETWEEN_REQUESTS)
+    spotify_client = SpotifyClient()
 
     for i, profile_url in enumerate(profile_urls, 1):
         print(f"\n[{i}/{len(profile_urls)}] {profile_url}")

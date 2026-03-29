@@ -12,7 +12,7 @@ from spotify_scraper import SpotifyClient
 # SETTINGS
 # ============================================================
 
-SPREADSHEET_ID = "YOUR_GOOGLE_SHEET_ID_HERE"
+SPREADSHEET_ID = "dIjl5darXJ678ftBALLK-vqWkXopWRryvUlPGRdLJ9Q"
 PROFILE_DUMP_SHEET = "profile link dump"
 DELAY_BETWEEN_REQUESTS = 2
 

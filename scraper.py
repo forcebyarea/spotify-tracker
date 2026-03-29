@@ -4,9 +4,9 @@ import json
 import os
 import re
 import requests
+import base64
 from datetime import datetime
 from google.oauth2.service_account import Credentials
-from spotify_scraper import SpotifyClient
 
 # ============================================================
 # SETTINGS
@@ -14,7 +14,7 @@ from spotify_scraper import SpotifyClient
 
 SPREADSHEET_ID = "1dIjl5darXJ678ftBALLK-vqWkXopWRryvUlPGRdLJ9Q"
 PROFILE_DUMP_SHEET = "profile link dump"
-DELAY_BETWEEN_REQUESTS = 2
+DELAY_BETWEEN_REQUESTS = 1
 
 # ============================================================
 # GOOGLE SHEETS
@@ -22,203 +22,134 @@ DELAY_BETWEEN_REQUESTS = 2
 
 def connect_to_sheets():
     print("🔗 Connecting to Google Sheets...")
-    creds_json = os.environ.get("GOOGLE_CREDENTIALS")
 
-    if creds_json:
-        creds_dict = json.loads(creds_json)
-        creds = Credentials.from_service_account_info(
-            creds_dict,
-            scopes=[
-                "https://spreadsheets.google.com/feeds",
-                "https://www.googleapis.com/auth/drive"
-            ]
-        )
-    else:
-        creds = Credentials.from_service_account_file(
-            "service_account.json",
-            scopes=[
-                "https://spreadsheets.google.com/feeds",
-                "https://www.googleapis.com/auth/drive"
-            ]
-        )
+    creds_dict = json.loads(os.environ.get("GOOGLE_CREDENTIALS"))
+
+    creds = Credentials.from_service_account_info(
+        creds_dict,
+        scopes=[
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive"
+        ]
+    )
 
     client = gspread.authorize(creds)
-    spreadsheet = client.open_by_key(SPREADSHEET_ID)
+    sheet = client.open_by_key(SPREADSHEET_ID)
+
     print("✅ Connected to Google Sheets")
-    return spreadsheet
+    return sheet
 
 # ============================================================
-# TOKEN (FIXES 401)
+# SPOTIFY TOKEN (OFFICIAL)
 # ============================================================
 
 def get_spotify_token():
-    print("   🔑 Fetching Spotify token...")
+    print("🔑 Getting Spotify API token...")
 
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0"
-        }
+    client_id = os.environ.get("7361185e568646d79675f5d8b4a77df6")
+    client_secret = os.environ.get("383d0b02cf1f4a5fa07fc4fa296ee37e")
 
-        res = requests.get("https://open.spotify.com", headers=headers, timeout=15)
+    auth_str = f"{client_id}:{client_secret}"
+    b64_auth = base64.b64encode(auth_str.encode()).decode()
 
-        if res.status_code != 200:
-            print(f"❌ Failed to load Spotify page: {res.status_code}")
-            return None
+    headers = {
+        "Authorization": f"Basic {b64_auth}"
+    }
 
-        # Extract access token from page
-        match = re.search(r'"accessToken":"(.*?)"', res.text)
+    data = {
+        "grant_type": "client_credentials"
+    }
 
-        if not match:
-            print("❌ Token not found in page")
-            return None
+    res = requests.post(
+        "https://accounts.spotify.com/api/token",
+        headers=headers,
+        data=data
+    )
 
-        token = match.group(1)
-        print("   ✅ Token fetched")
-        return token
-
-    except Exception as e:
-        print(f"❌ Token error: {e}")
+    if res.status_code != 200:
+        print("❌ Failed to get token")
         return None
-# ============================================================
-# GET URLS
-# ============================================================
 
-def get_profile_urls(spreadsheet):
-    sheet = spreadsheet.worksheet(PROFILE_DUMP_SHEET)
-    values = sheet.col_values(1)
-    return [v.strip() for v in values[1:] if v.strip()]
+    print("✅ Token received")
+    return res.json().get("access_token")
+
+# ============================================================
+# EXTRACT USER ID
+# ============================================================
 
 def extract_user_id(url):
     m = re.search(r"/user/([^/?]+)", url)
     return m.group(1) if m else None
 
 # ============================================================
-# 🔥 FETCH ALL PLAYLISTS (UNLIMITED)
+# GET USER PLAYLISTS (API)
 # ============================================================
 
-def get_all_playlists(user_id, token):
-    print("   🔄 Fetching ALL playlists...")
+def get_user_playlists(user_id, token):
+    print("   📡 Fetching playlists via API...")
 
-    url = f"https://spclient.wg.spotify.com/user-profile-view/v3/profile/{user_id}/playlists"
+    url = f"https://api.spotify.com/v1/users/{user_id}/playlists"
 
     headers = {
-        "Authorization": f"Bearer {token}",
-        "User-Agent": "Mozilla/5.0",
-        "App-platform": "WebPlayer"
+        "Authorization": f"Bearer {token}"
     }
 
     playlists = []
-    offset = 0
-    limit = 50
 
-    while True:
-        params = {"offset": offset, "limit": limit}
-
-        res = requests.get(url, headers=headers, params=params)
+    while url:
+        res = requests.get(url, headers=headers)
 
         if res.status_code != 200:
             print(f"   ❌ API error: {res.status_code}")
             break
 
         data = res.json()
-        items = data.get("public_playlists", [])
 
-        if not items:
-            break
-
-        for item in items:
-            uri = item.get("uri", "")
-            pid = uri.split(":")[-1] if uri else None
-
-            if pid:
-                playlists.append({
-                    "name": item.get("name", "Unknown"),
-                    "url": f"https://open.spotify.com/playlist/{pid}"
-                })
-
-        offset += limit
-        time.sleep(1)
-
-    print(f"   ✅ Total playlists found: {len(playlists)}")
-    return playlists
-
-# ============================================================
-# SCRAPE PROFILE
-# ============================================================
-
-def scrape_profile(profile_url, client):
-    user_id = extract_user_id(profile_url)
-
-    if not user_id:
-        print("   ❌ Invalid profile URL")
-        return None, []
-
-    print(f"   🎵 Profile: {user_id}")
-
-    token = get_spotify_token()
-    if not token:
-        return None, []
-
-    all_playlists = get_all_playlists(user_id, token)
-
-    playlists = []
-
-    for p in all_playlists:
-        try:
-            data = client.get_playlist_info(p["url"])
-
-            if not data:
-                continue
-
-            followers_raw = data.get("followers", 0)
-            followers = followers_raw.get("total", 0) if isinstance(followers_raw, dict) else int(followers_raw or 0)
-
+        for item in data.get("items", []):
             playlists.append({
-                "name": p["name"],
-                "url": p["url"],
-                "followers": followers
+                "name": item["name"],
+                "url": item["external_urls"]["spotify"],
+                "followers": item["followers"]["total"]
             })
 
-            print(f"      ✓ {p['name']} — {followers}")
-            time.sleep(DELAY_BETWEEN_REQUESTS)
+        url = data.get("next")
+        time.sleep(0.5)
 
-        except Exception as e:
-            print(f"      ⚠️ Error: {e}")
-
-    return user_id, playlists
+    print(f"   ✅ Found {len(playlists)} playlists")
+    return playlists
 
 # ============================================================
 # GOOGLE SHEETS WRITE
 # ============================================================
 
-def update_followers_sheet(spreadsheet, profile_url, display_name, playlists):
+def update_sheet(sheet, profile_url, name, playlists):
     if not playlists:
         return
 
-    name = re.sub(r'[^a-zA-Z0-9]', '_', display_name)
-    sheet_name = name + "_Followers"
+    clean = re.sub(r'[^a-zA-Z0-9]', '_', name)
+    sheet_name = clean + "_Followers"
 
     try:
-        sheet = spreadsheet.worksheet(sheet_name)
+        ws = sheet.worksheet(sheet_name)
     except:
-        sheet = spreadsheet.add_worksheet(title=sheet_name, rows=500, cols=50)
+        ws = sheet.add_worksheet(title=sheet_name, rows=500, cols=50)
 
-    data = sheet.get_all_values()
+    data = ws.get_all_values()
 
     if not data:
-        sheet.update("A1:C1", [["Profile", display_name, profile_url]])
-        sheet.update("A2:B2", [["Playlist", "URL"]])
+        ws.update("A1:C1", [["Profile", name, profile_url]])
+        ws.update("A2:B2", [["Playlist", "URL"]])
 
-    col = len(sheet.row_values(2)) + 1
+    col = len(ws.row_values(2)) + 1
     timestamp = datetime.now().strftime("%d %b %H:%M")
-    sheet.update_cell(2, col, timestamp)
+    ws.update_cell(2, col, timestamp)
 
     for i, p in enumerate(playlists, start=3):
-        sheet.update_cell(i, 1, p["name"])
-        sheet.update_cell(i, 2, p["url"])
-        sheet.update_cell(i, col, p["followers"])
+        ws.update_cell(i, 1, p["name"])
+        ws.update_cell(i, 2, p["url"])
+        ws.update_cell(i, col, p["followers"])
 
-    print(f"   📊 Updated sheet: {sheet_name}")
+    print(f"   📊 Updated: {sheet_name}")
 
 # ============================================================
 # MAIN
@@ -226,32 +157,39 @@ def update_followers_sheet(spreadsheet, profile_url, display_name, playlists):
 
 def main():
     print("=" * 50)
-    print("SPOTIFY TRACKER — FINAL VERSION")
+    print("SPOTIFY TRACKER — API VERSION")
     print("=" * 50)
 
     sheet = connect_to_sheets()
-    urls = get_profile_urls(sheet)
 
-    if not urls:
-        print("❌ No URLs")
+    urls = sheet.worksheet(PROFILE_DUMP_SHEET).col_values(1)[1:]
+
+    token = get_spotify_token()
+
+    if not token:
+        print("❌ Cannot continue without token")
         return
 
-    client = SpotifyClient()
-
     for i, url in enumerate(urls, 1):
-        print(f"\n[{i}/{len(urls)}] {url}")
+        if not url.strip():
+            continue
 
-        name, playlists = scrape_profile(url, client)
+        print(f"\n[{i}] {url}")
+
+        user_id = extract_user_id(url)
+
+        if not user_id:
+            print("   ❌ Invalid URL")
+            continue
+
+        playlists = get_user_playlists(user_id, token)
 
         if playlists:
-            update_followers_sheet(sheet, url, name, playlists)
+            update_sheet(sheet, url, user_id, playlists)
         else:
-            print("   ⚠️ No data")
+            print("   ⚠️ No playlists found")
 
         time.sleep(DELAY_BETWEEN_REQUESTS)
-
-    if hasattr(client, "close"):
-        client.close()
 
     print("\n✅ DONE")
 

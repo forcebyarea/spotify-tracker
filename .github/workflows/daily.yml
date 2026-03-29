@@ -9,6 +9,9 @@ on:
   # This lets you also run it manually from GitHub website anytime
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true  # Fix for Node.js 20 deprecation warning
+
 jobs:
   scrape:
     runs-on: ubuntu-latest  # GitHub provides this free computer
@@ -16,11 +19,11 @@ jobs:
     steps:
       # Step 1 — Download your code from the repo
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
 
       # Step 2 — Install Python
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v5.6.0
         with:
           python-version: "3.11"
 

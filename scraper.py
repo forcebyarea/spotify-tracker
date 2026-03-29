@@ -46,8 +46,17 @@ def connect_to_sheets():
 def get_spotify_token():
     print("🔑 Getting Spotify API token...")
 
-    client_id = os.environ.get("7361185e568646d79675f5d8b4a77df6")
-    client_secret = os.environ.get("383d0b02cf1f4a5fa07fc4fa296ee37e")
+    client_id = os.environ.get("SPOTIFY_CLIENT_ID")
+    client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET")
+
+    print("CLIENT_ID exists:", bool(client_id))
+    print("CLIENT_SECRET exists:", bool(client_secret))
+
+    if not client_id or not client_secret:
+        print("❌ Missing Spotify credentials")
+        return None
+
+    import base64
 
     auth_str = f"{client_id}:{client_secret}"
     b64_auth = base64.b64encode(auth_str.encode()).decode()
@@ -66,8 +75,11 @@ def get_spotify_token():
         data=data
     )
 
+    print("Status:", res.status_code)
+    print("Response:", res.text)
+
     if res.status_code != 200:
-        print("❌ Failed to get token")
+        print("❌ Token request failed")
         return None
 
     print("✅ Token received")

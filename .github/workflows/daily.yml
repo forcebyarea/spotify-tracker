@@ -1,0 +1,36 @@
+name: Daily Spotify Tracker
+
+on:
+  schedule:
+    # Runs every day at 3:00 AM UTC = 8:30 AM India time
+    # To change time, use crontab.guru website to generate your own schedule
+    - cron: "0 3 * * *"
+
+  # This lets you also run it manually from GitHub website anytime
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest  # GitHub provides this free computer
+
+    steps:
+      # Step 1 — Download your code from the repo
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Step 2 — Install Python
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Step 3 — Install the Python packages your script needs
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Step 4 — Run your scraper script
+      # GOOGLE_CREDENTIALS is the secret you will add in GitHub settings
+      - name: Run Spotify scraper
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+        run: python scraper.py

@@ -6,85 +6,69 @@ import os
 import re
 from datetime import datetime
 from google.oauth2.service_account import Credentials
+from bs4 import BeautifulSoup
 
 # ============================================================
-#  SETTINGS — only edit this section
+#  SETTINGS — only edit SPREADSHEET_ID
 # ============================================================
 
-SPREADSHEET_ID = "1dIjl5darXJ678ftBALLK-vqWkXopWRryvUlPGRdLJ9Q"
-# Find in your Sheet URL:
-# https://docs.google.com/spreadsheets/d/THIS_PART/edit
-
+SPREADSHEET_ID     = "1dIjl5darXJ678ftBALLK-vqWkXopWRryvUlPGRdLJ9Q"
 PROFILE_DUMP_SHEET = "profile link dump"
-# Tab name with your Spotify profile URLs in column A
-
-DELAY = 1  # seconds between Spotify API calls
+DELAY              = 1.5
 
 # ============================================================
-#  HOW THIS WORKS — one script does everything
-#  -------------------------------------------------------
-#  Every run it:
-#  1. Gets a Spotify token using your Client ID + Secret
+#  HOW THIS WORKS
+#  1. Gets Spotify token via Client Credentials (your secrets)
 #  2. Reads profile URLs from your dump sheet
-#  3. For each profile — fetches ALL their public playlists
-#  4. For each playlist — fetches current follower count
-#  5. Creates/updates a _Followers sheet per profile
-#  6. Adds a new date column with today's counts
-#  7. Colours cells yellow (growth) or red (decline)
-#  8. Sorts playlists by follower count
-#
-#  Client ID + Secret are stored as GitHub Secrets —
-#  never hardcoded, never visible in your code.
+#  3. Scrapes each profile's PUBLIC page to find playlist IDs
+#     (no auth needed — just HTML from open.spotify.com)
+#  4. Uses Client Credentials token to get follower count
+#     for each playlist via GET /playlists/{id}  ← this works!
+#  5. Writes everything into _Followers sheets + Master Table
 # ============================================================
 
 
 # ============================================================
-#  STEP 1 — GET SPOTIFY TOKEN
-#  Uses Client Credentials — works for ANY public profile
+#  GET SPOTIFY TOKEN — Client Credentials
 # ============================================================
 
 def get_spotify_token():
     print("🔑 Getting Spotify token...")
-
-    # Read from GitHub Secrets (environment variables)
     client_id     = os.environ.get("SPOTIFY_CLIENT_ID")
     client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET")
 
     if not client_id or not client_secret:
         raise Exception(
-            "❌ SPOTIFY_CLIENT_ID or SPOTIFY_CLIENT_SECRET not found.\n"
-            "   Go to GitHub → Settings → Secrets and add both secrets."
+            "❌ SPOTIFY_CLIENT_ID or SPOTIFY_CLIENT_SECRET missing.\n"
+            "   Add them in GitHub → Settings → Secrets → Actions"
         )
 
-    response = requests.post(
+    import base64
+    resp = requests.post(
         "https://accounts.spotify.com/api/token",
         data={"grant_type": "client_credentials"},
         headers={
-            "Authorization": "Basic " + __import__("base64").b64encode(
+            "Authorization": "Basic " + base64.b64encode(
                 f"{client_id}:{client_secret}".encode()
             ).decode()
         },
         timeout=15
     )
 
-    if response.status_code != 200:
-        raise Exception(f"❌ Token request failed: {response.status_code} — {response.text}")
+    if resp.status_code != 200:
+        raise Exception(f"❌ Token failed: {resp.status_code} — {resp.text}")
 
-    token = response.json().get("access_token")
-    if not token:
-        raise Exception("❌ No access_token in response")
-
+    token = resp.json().get("access_token")
     print("   ✅ Token obtained")
     return token
 
 
 # ============================================================
-#  STEP 2 — CONNECT TO GOOGLE SHEETS
+#  CONNECT TO GOOGLE SHEETS
 # ============================================================
 
 def connect_to_sheets():
     print("🔗 Connecting to Google Sheets...")
-
     creds_json = os.environ.get("GOOGLE_CREDENTIALS")
 
     if creds_json:
@@ -104,95 +88,97 @@ def connect_to_sheets():
             ]
         )
 
-    client   = gspread.authorize(creds)
-    sheet    = client.open_by_key(SPREADSHEET_ID)
+    client      = gspread.authorize(creds)
+    spreadsheet = client.open_by_key(SPREADSHEET_ID)
     print("   ✅ Connected")
-    return sheet
+    return spreadsheet
 
 
 # ============================================================
-#  STEP 3 — READ PROFILE URLS FROM DUMP SHEET
+#  READ PROFILE URLS
 # ============================================================
 
 def get_profile_urls(spreadsheet):
     print("📋 Reading profile URLs...")
     sheet  = spreadsheet.worksheet(PROFILE_DUMP_SHEET)
     values = sheet.col_values(1)
-    urls   = [u.strip() for u in values[1:] if u.strip()]
-
-    valid = []
-    for url in urls:
-        if "/user/" in url or "/profile/" in url:
-            valid.append(url)
-        elif url:
-            print(f"   ⚠️ Skipping non-profile URL: {url[:60]}")
-
-    print(f"   Found {len(valid)} profile URLs")
-    return valid
+    urls   = []
+    for u in values[1:]:
+        u = u.strip()
+        if "/user/" in u or "/profile/" in u:
+            urls.append(u)
+        elif u:
+            print(f"   ⚠️ Skipping: {u[:60]}")
+    print(f"   Found {len(urls)} profile URLs")
+    return urls
 
 
 # ============================================================
-#  STEP 4 — FETCH ALL PLAYLISTS FOR A PROFILE
+#  SCRAPE PLAYLIST IDs FROM PUBLIC PROFILE PAGE
+#  This works without any auth — just reads public HTML
 # ============================================================
 
-def get_user_playlists(user_id, token):
-    playlists = []
-    url       = f"https://api.spotify.com/v1/users/{user_id}/playlists?limit=50"
-    headers   = {"Authorization": f"Bearer {token}"}
+def get_playlist_ids_from_profile(user_id):
+    url     = f"https://open.spotify.com/user/{user_id}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9"
+    }
 
-    while url:
-        try:
-            resp = requests.get(url, headers=headers, timeout=15)
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            print(f"   ⚠️ Profile page status: {resp.status_code}")
+            return []
 
-            if resp.status_code == 429:
-                wait = int(resp.headers.get("Retry-After", 3))
-                print(f"      ⏳ Rate limited — waiting {wait}s...")
-                time.sleep(wait)
-                continue
+        html = resp.text
 
-            if resp.status_code == 401:
-                print("      ❌ Token expired")
-                return None
+        # Method 1 — find playlist IDs in __NEXT_DATA__ JSON blob
+        ids = []
+        nd_match = re.search(
+            r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+            html, re.DOTALL
+        )
+        if nd_match:
+            try:
+                nd = json.loads(nd_match.group(1))
+                # Walk the JSON to find playlist URIs
+                text = json.dumps(nd)
+                ids  = re.findall(r'spotify:playlist:([A-Za-z0-9]{22})', text)
+                ids  = list(dict.fromkeys(ids))  # deduplicate
+            except:
+                pass
 
-            if resp.status_code != 200:
-                print(f"      ⚠️ Status {resp.status_code} for {user_id}")
-                break
+        # Method 2 — find in raw HTML if __NEXT_DATA__ had nothing
+        if not ids:
+            ids  = re.findall(r'spotify:playlist:([A-Za-z0-9]{22})', html)
+            ids += re.findall(r'"/playlist/([A-Za-z0-9]{22})"', html)
+            ids  = list(dict.fromkeys(ids))
 
-            data  = resp.json()
-            items = data.get("items", [])
+        # Method 3 — BeautifulSoup href scan
+        if not ids:
+            soup  = BeautifulSoup(html, "html.parser")
+            links = soup.find_all("a", href=re.compile(r"/playlist/[A-Za-z0-9]{22}"))
+            ids   = list(dict.fromkeys([
+                re.search(r"/playlist/([A-Za-z0-9]{22})", a["href"]).group(1)
+                for a in links if re.search(r"/playlist/([A-Za-z0-9]{22})", a["href"])
+            ]))
 
-            for item in items:
-                if not item:
-                    continue
-                # Only playlists OWNED by this user
-                owner_id = item.get("owner", {}).get("id", "")
-                if owner_id != user_id:
-                    continue
-                ext_url = item.get("external_urls", {}).get("spotify", "")
-                if ext_url:
-                    playlists.append({
-                        "id":   item.get("id", ""),
-                        "name": item.get("name", "Unknown"),
-                        "url":  ext_url
-                    })
+        print(f"   Found {len(ids)} playlist IDs on profile page")
+        return ids
 
-            url = data.get("next")
-            if url:
-                time.sleep(DELAY)
-
-        except Exception as e:
-            print(f"      ❌ Error: {e}")
-            break
-
-    return playlists
+    except Exception as e:
+        print(f"   ❌ Error scraping profile page: {e}")
+        return []
 
 
 # ============================================================
-#  STEP 5 — FETCH FOLLOWER COUNT FOR ONE PLAYLIST
+#  GET PLAYLIST DETAILS + FOLLOWERS
+#  Uses Client Credentials — works for ANY public playlist ✅
 # ============================================================
 
-def get_playlist_followers(playlist_id, token):
-    url     = f"https://api.spotify.com/v1/playlists/{playlist_id}?fields=followers"
+def get_playlist_details(playlist_id, token):
+    url     = f"https://api.spotify.com/v1/playlists/{playlist_id}?fields=id,name,external_urls,followers,owner"
     headers = {"Authorization": f"Bearer {token}"}
 
     try:
@@ -200,102 +186,102 @@ def get_playlist_followers(playlist_id, token):
 
         if resp.status_code == 429:
             wait = int(resp.headers.get("Retry-After", 3))
+            print(f"      ⏳ Rate limited — waiting {wait}s...")
             time.sleep(wait)
             resp = requests.get(url, headers=headers, timeout=15)
 
-        if resp.status_code != 200:
-            return 0
+        if resp.status_code == 401:
+            return None  # token expired signal
 
-        data = resp.json()
+        if resp.status_code != 200:
+            return {}
+
+        data      = resp.json()
         followers = data.get("followers", {})
-        return followers.get("total", 0) if isinstance(followers, dict) else 0
+        if isinstance(followers, dict):
+            follower_count = followers.get("total", 0)
+        else:
+            follower_count = int(followers or 0)
+
+        owner    = data.get("owner", {})
+        owner_id = owner.get("id", "") if isinstance(owner, dict) else ""
+
+        return {
+            "id":        data.get("id", playlist_id),
+            "name":      data.get("name", "Unknown"),
+            "url":       data.get("external_urls", {}).get("spotify", f"https://open.spotify.com/playlist/{playlist_id}"),
+            "followers": follower_count,
+            "owner_id":  owner_id
+        }
 
     except Exception as e:
-        print(f"      ⚠️ Followers error: {e}")
-        return 0
+        print(f"      ⚠️ Error: {e}")
+        return {}
 
 
 # ============================================================
-#  STEP 6 — WRITE DATA INTO A _Followers SHEET
+#  WRITE TO _Followers SHEET
 # ============================================================
 
-def update_followers_sheet(spreadsheet, profile_url, display_name, playlists_with_counts):
-    if not playlists_with_counts:
+def update_followers_sheet(spreadsheet, profile_url, display_name, playlists):
+    if not playlists:
         return
 
     clean_name = re.sub(r'[^a-zA-Z0-9]', '_', display_name)
     sheet_name = clean_name + "_Followers"
 
-    # Get or create the sheet
     try:
         sheet = spreadsheet.worksheet(sheet_name)
-        print(f"   📄 Updating: {sheet_name}")
+        print(f"   📄 Updating:  {sheet_name}")
     except gspread.WorksheetNotFound:
         sheet = spreadsheet.add_worksheet(title=sheet_name, rows=500, cols=100)
-        print(f"   📄 Created:  {sheet_name}")
+        print(f"   📄 Created:   {sheet_name}")
 
     existing_data = sheet.get_all_values()
 
-    # Set up headers if brand new sheet
+    # Headers if new sheet
     if not existing_data or len(existing_data) < 2:
-        sheet.update("A1:C1", [["Profile Name", display_name, profile_url]])
+        sheet.update(values=[["Profile Name", display_name, profile_url]], range_name="A1:C1")
         sheet.format("A1:C1", {"textFormat": {"bold": True}})
-        sheet.update("A2:B2", [["Playlist Name", "Playlist URL"]])
+        sheet.update(values=[["Playlist Name", "Playlist URL"]], range_name="A2:B2")
         sheet.format("A2:B2", {"textFormat": {"bold": True}})
         existing_data = sheet.get_all_values()
 
-    # Always update display name in B1 in case it changed
-    sheet.update_cell(1, 2, display_name)
-
-    # Add today's date as new column header in row 2
+    # New date column
     today         = datetime.now().strftime("%d %b %H:%M")
     last_col      = len(existing_data[1]) if len(existing_data) > 1 else 2
     new_col_index = last_col + 1
 
     sheet.update_cell(2, new_col_index, today)
-    sheet.format(
-        gspread.utils.rowcol_to_a1(2, new_col_index),
-        {"textFormat": {"bold": True}}
-    )
+    sheet.format(gspread.utils.rowcol_to_a1(2, new_col_index), {"textFormat": {"bold": True}})
 
-    # Build URL → row number lookup from existing data
-    url_to_row  = {}
+    # URL → row lookup
+    url_to_row   = {}
     for i, row in enumerate(existing_data[2:], start=3):
         if len(row) > 1 and row[1]:
             url_to_row[row[1].strip()] = i
-
     next_new_row = len(existing_data) + 1
-    written      = 0
 
-    for playlist in playlists_with_counts:
+    for playlist in playlists:
         clean_url = playlist["url"].split("?")[0]
-
-        if clean_url in url_to_row:
-            row_num = url_to_row[clean_url]
-        else:
-            row_num = next_new_row
+        row_num   = url_to_row.get(clean_url, next_new_row)
+        if clean_url not in url_to_row:
+            url_to_row[clean_url] = next_new_row
             next_new_row += 1
-            url_to_row[clean_url] = row_num
 
-        # Write name and URL
         sheet.update_cell(row_num, 1, playlist["name"])
         sheet.update_cell(row_num, 2, clean_url)
-
-        # Write follower count
         sheet.update_cell(row_num, new_col_index, playlist["followers"])
 
-        # Colour cell based on growth vs previous column
+        # Colour: yellow = growth, red = decline, white = no change
         if new_col_index > 3:
             try:
-                prev_val = sheet.cell(row_num, new_col_index - 1).value
-                if prev_val and str(prev_val).strip().lstrip('-').isdigit():
-                    diff = playlist["followers"] - int(prev_val)
-                    if diff > 0:
-                        color = {"red": 1.0, "green": 1.0, "blue": 0.0}   # yellow
-                    elif diff < 0:
-                        color = {"red": 1.0, "green": 0.2, "blue": 0.2}   # red
-                    else:
-                        color = {"red": 1.0, "green": 1.0, "blue": 1.0}   # white
+                prev = sheet.cell(row_num, new_col_index - 1).value
+                if prev and str(prev).strip().lstrip('-').isdigit():
+                    diff  = playlist["followers"] - int(prev)
+                    color = ({"red": 1.0, "green": 1.0, "blue": 0.0} if diff > 0 else
+                             {"red": 1.0, "green": 0.2, "blue": 0.2} if diff < 0 else
+                             {"red": 1.0, "green": 1.0, "blue": 1.0})
                     sheet.format(
                         gspread.utils.rowcol_to_a1(row_num, new_col_index),
                         {"backgroundColor": color}
@@ -303,113 +289,99 @@ def update_followers_sheet(spreadsheet, profile_url, display_name, playlists_wit
             except:
                 pass
 
-        written += 1
-
-    # Sort rows by follower count descending (latest column)
-    sort_data = sheet.get_all_values()
-    if len(sort_data) > 3:
-        data_rows   = sort_data[2:]  # everything from row 3 down
+    # Sort by latest follower count descending
+    all_data = sheet.get_all_values()
+    if len(all_data) > 3:
+        data_rows = all_data[2:]
         sorted_rows = sorted(
             data_rows,
-            key=lambda r: int(r[new_col_index - 1]) if len(r) >= new_col_index and str(r[new_col_index - 1]).strip().lstrip('-').isdigit() else 0,
+            key=lambda r: int(r[new_col_index - 1]) if (
+                len(r) >= new_col_index and
+                str(r[new_col_index - 1]).strip().lstrip('-').isdigit()
+            ) else 0,
             reverse=True
         )
         if sorted_rows != data_rows:
-            sheet.update(
-                f"A3:{gspread.utils.rowcol_to_a1(2 + len(sorted_rows), new_col_index)}",
-                sorted_rows
-            )
+            end_cell = gspread.utils.rowcol_to_a1(2 + len(sorted_rows), new_col_index)
+            sheet.update(values=sorted_rows, range_name=f"A3:{end_cell}")
 
-    print(f"   ✅ {written} playlists written — sorted by followers")
+    print(f"   ✅ {len(playlists)} playlists written to {sheet_name}")
 
 
 # ============================================================
-#  STEP 7 — UPDATE MASTER TABLE
+#  UPDATE MASTER TABLE
 # ============================================================
 
-def update_master_table(spreadsheet, profile_links):
-    sheet_name   = "Master Table"
-    base_url     = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}"
+def update_master_table(spreadsheet, profile_urls):
+    print("\n📊 Updating Master Table...")
+    base_url   = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}"
 
     try:
-        master = spreadsheet.worksheet(sheet_name)
+        master = spreadsheet.worksheet("Master Table")
         master.clear()
     except gspread.WorksheetNotFound:
-        master = spreadsheet.add_worksheet(title=sheet_name, rows=200, cols=5)
+        master = spreadsheet.add_worksheet(title="Master Table", rows=200, cols=5)
 
-    headers = ["Display Name", "Profile URL", "Followers Sheet", "Last Updated"]
-    master.update("A1:D1", [headers])
+    master.update(values=[["Display Name", "Profile URL", "Followers Sheet", "Last Updated"]], range_name="A1:D1")
     master.format("A1:D1", {"textFormat": {"bold": True}})
 
-    # Build a lookup of all _Followers sheets
-    all_sheets    = spreadsheet.worksheets()
-    url_to_sheet  = {}
-    for s in all_sheets:
+    # Build lookup of all _Followers sheets by their C1 URL value
+    url_to_sheet = {}
+    for s in spreadsheet.worksheets():
         if s.title.endswith("_Followers"):
             try:
-                c1_val = s.cell(1, 3).value  # profile URL in C1
-                if c1_val:
-                    url_to_sheet[c1_val.strip()] = s
+                c1 = s.cell(1, 3).value
+                if c1:
+                    url_to_sheet[c1.strip()] = s
             except:
                 pass
 
-    rows = []
-    for url in profile_links:
-        fsheet = url_to_sheet.get(url)
-        if fsheet:
-            display_name  = fsheet.cell(1, 2).value or url
-            sheet_link    = f'=HYPERLINK("{base_url}#gid={fsheet.id}","{fsheet.title}")'
+    for i, url in enumerate(profile_urls, start=2):
+        fs           = url_to_sheet.get(url)
+        display_name = fs.cell(1, 2).value if fs else url
+        link         = (f'=HYPERLINK("{base_url}#gid={fs.id}","{fs.title}")'
+                        if fs else "Not created yet")
+        master.update_cell(i, 1, display_name)
+        master.update_cell(i, 2, url)
+        if fs:
+            master.update_cell(i, 3, link)
         else:
-            display_name  = url
-            sheet_link    = "Not created yet"
+            master.update_cell(i, 3, link)
+        master.update_cell(i, 4, datetime.now().strftime("%Y-%m-%d %H:%M"))
 
-        rows.append([display_name, url, sheet_link, datetime.now().strftime("%Y-%m-%d %H:%M")])
-
-    if rows:
-        master.update(f"A2:C{1 + len(rows)}", [[r[0], r[1], ""] for r in rows])
-        for i, row in enumerate(rows, start=2):
-            if row[2].startswith("="):
-                master.update_cell(i, 3, row[2])
-            else:
-                master.update_cell(i, 3, row[2])
-            master.update_cell(i, 4, row[3])
-
-    print(f"   ✅ Master Table updated — {len(rows)} profiles")
+    print(f"   ✅ Master Table updated — {len(profile_urls)} profiles")
 
 
 # ============================================================
-#  MAIN — runs everything in one go
+#  MAIN
 # ============================================================
 
 def main():
     print("=" * 55)
-    print("  SPOTIFY FOLLOWER TRACKER — Full Auto")
+    print("  SPOTIFY FOLLOWER TRACKER")
     print(f"  Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 55)
 
-    # Connect
     token       = get_spotify_token()
     spreadsheet = connect_to_sheets()
-    profile_urls = get_profile_urls(spreadsheet)
+    profiles    = get_profile_urls(spreadsheet)
 
-    if not profile_urls:
-        print("\n❌ No profile URLs found in dump sheet. Exiting.")
+    if not profiles:
+        print("❌ No profile URLs found. Exiting.")
         return
 
     headers = {"Authorization": f"Bearer {token}"}
 
-    for i, profile_url in enumerate(profile_urls, 1):
-        print(f"\n[{i}/{len(profile_urls)}] {profile_url}")
+    for i, profile_url in enumerate(profiles, 1):
+        print(f"\n[{i}/{len(profiles)}] {profile_url}")
 
-        # Extract user ID
         match = re.search(r"/(?:user|profile)/([^/?]+)", profile_url)
         if not match:
             print("   ⚠️ Can't extract user ID — skipping")
             continue
-
         user_id = match.group(1)
 
-        # Get display name
+        # Get display name via API (this endpoint works with Client Credentials)
         try:
             user_resp    = requests.get(
                 f"https://api.spotify.com/v1/users/{user_id}",
@@ -418,45 +390,47 @@ def main():
             display_name = user_resp.json().get("display_name") or user_id
         except:
             display_name = user_id
-
         print(f"   👤 {display_name}")
 
-        # Get all playlists
-        playlists = get_user_playlists(user_id, token)
-
-        if playlists is None:
-            # Token expired — refresh and retry
-            print("   🔄 Refreshing token...")
-            token    = get_spotify_token()
-            headers  = {"Authorization": f"Bearer {token}"}
-            playlists = get_user_playlists(user_id, token)
-
-        if not playlists:
-            print(f"   ⚠️ No public playlists found")
+        # Step 1 — scrape playlist IDs from public profile page (no auth)
+        playlist_ids = get_playlist_ids_from_profile(user_id)
+        if not playlist_ids:
+            print("   ⚠️ No playlists found on profile page")
             continue
 
-        print(f"   Found {len(playlists)} playlists — fetching follower counts...")
+        # Step 2 — get details + followers for each playlist via API
+        print(f"   Fetching details for {len(playlist_ids)} playlists...")
+        playlists = []
+        for j, pid in enumerate(playlist_ids, 1):
+            details = get_playlist_details(pid, token)
 
-        # Get follower count for each playlist
-        playlists_with_counts = []
-        for j, playlist in enumerate(playlists, 1):
-            followers = get_playlist_followers(playlist["id"], token)
-            playlists_with_counts.append({**playlist, "followers": followers})
-            print(f"      [{j}/{len(playlists)}] {playlist['name']}: {followers:,}")
+            if details is None:
+                # Token expired — refresh
+                print("   🔄 Token expired — refreshing...")
+                token   = get_spotify_token()
+                headers = {"Authorization": f"Bearer {token}"}
+                details = get_playlist_details(pid, token)
+
+            if not details:
+                continue
+
+            # Only include playlists owned by this user
+            if details.get("owner_id") and details["owner_id"] != user_id:
+                continue
+
+            playlists.append(details)
+            print(f"      [{j}/{len(playlist_ids)}] {details['name']}: {details['followers']:,} followers")
             time.sleep(DELAY)
 
-        # Write to sheet
-        update_followers_sheet(spreadsheet, profile_url, display_name, playlists_with_counts)
+        # Step 3 — write to sheet
+        update_followers_sheet(spreadsheet, profile_url, display_name, playlists)
 
-    # Update master table
-    print("\n📊 Updating Master Table...")
-    update_master_table(spreadsheet, profile_urls)
+    update_master_table(spreadsheet, profiles)
 
     print("\n" + "=" * 55)
-    print(f"  ✅ All done!")
+    print(f"  ✅ Done!")
     print(f"  Finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 55)
-
 
 if __name__ == "__main__":
     main()

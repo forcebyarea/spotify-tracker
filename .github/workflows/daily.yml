@@ -3,10 +3,8 @@ name: Daily Spotify Tracker
 on:
   schedule:
     # Runs every day at 3:00 AM UTC = 8:30 AM India time
-    # To change time, use crontab.guru website to generate your own schedule
     - cron: "0 3 * * *"
 
-  # This lets you also run it manually from GitHub website anytime
   workflow_dispatch:
 
 jobs:
@@ -15,23 +13,20 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v4
         with:
           python-version: "3.11"
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # ✅ THIS IS THE FIXED STEP
       - name: Run Spotify scraper
+        run: python scraper.py
         env:
-- name: Run scraper
-  run: python scraper.py
-  env:
-    SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
-    SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
-    GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          
-        
+          SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+          SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}

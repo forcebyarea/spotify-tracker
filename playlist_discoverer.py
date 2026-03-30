@@ -70,32 +70,131 @@ def login_to_spotify(page):
 
     print("🔐 Logging into Spotify...")
     page.goto("https://accounts.spotify.com/en/login", wait_until="networkidle")
-    time.sleep(2)
-
-    # Fill email
-    page.fill('input[data-testid="login-username"]', email)
-    time.sleep(0.5)
-
-    # Fill password
-    page.fill('input[data-testid="login-password"]', password)
-    time.sleep(0.5)
-
-    # Click login button
-    page.click('button[data-testid="login-button"]')
+    page.wait_for_load_state("networkidle")
     time.sleep(3)
 
-    # Confirm we're logged in
-    if "accounts.spotify.com" in page.url and "login" in page.url:
-        # Try alternate selectors if first attempt failed
+    # ── STEP 1: Fill email and click Continue ──────────────────
+    print("   Step 1: Filling email...")
+    email_selectors = [
+        'input[data-testid="login-username"]',
+        'input[name="username"]',
+        'input[type="email"]',
+        'input[type="text"]',
+    ]
+    email_filled = False
+    for sel in email_selectors:
         try:
-            page.wait_for_selector('button[data-testid="login-button"]', timeout=3000)
-            print("   ⚠️ Still on login page — retrying...")
-            page.click('button[data-testid="login-button"]')
-            time.sleep(3)
+            page.wait_for_selector(sel, timeout=5000, state="visible")
+            page.click(sel)
+            time.sleep(0.5)
+            page.fill(sel, email)
+            time.sleep(0.5)
+            if page.input_value(sel):
+                print(f"   ✓ Email filled ({sel})")
+                email_filled = True
+                break
         except:
-            pass
+            continue
+    if not email_filled:
+        raise Exception("❌ Could not fill email field")
 
-    print(f"   ✅ Logged in — current URL: {page.url[:60]}")
+    # Click Continue button
+    continue_selectors = [
+        'button:has-text("Continue")',
+        'button[data-testid="login-button"]',
+        'button[type="submit"]',
+    ]
+    for sel in continue_selectors:
+        try:
+            page.wait_for_selector(sel, timeout=5000, state="visible")
+            page.click(sel)
+            print(f"   ✓ Clicked Continue ({sel})")
+            break
+        except:
+            continue
+
+    # Wait for next page to load (OTP screen)
+    time.sleep(4)
+    page.wait_for_load_state("networkidle")
+    print(f"   Current URL after Continue: {page.url[:80]}")
+
+    # ── STEP 2: Click "Log in with a password" ─────────────────
+    print("   Step 2: Clicking Log in with a password...")
+    password_link_selectors = [
+        'button:has-text("Log in with a password")',
+        'a:has-text("Log in with a password")',
+        '[data-testid="login-with-password-button"]',
+        'button:has-text("password")',
+        'a:has-text("password")',
+        'span:has-text("Log in with a password")',
+    ]
+    link_clicked = False
+    for sel in password_link_selectors:
+        try:
+            page.wait_for_selector(sel, timeout=6000, state="visible")
+            page.click(sel)
+            print(f"   ✓ Clicked password link ({sel})")
+            link_clicked = True
+            break
+        except:
+            continue
+    if not link_clicked:
+        raise Exception("❌ Could not find 'Log in with a password' link")
+
+    # Wait for password field to appear
+    time.sleep(3)
+    page.wait_for_load_state("networkidle")
+
+    # ── STEP 3: Fill password and log in ───────────────────────
+    print("   Step 3: Filling password...")
+    password_selectors = [
+        'input[data-testid="login-password"]',
+        'input[name="password"]',
+        'input[type="password"]',
+    ]
+    password_filled = False
+    for sel in password_selectors:
+        try:
+            page.wait_for_selector(sel, timeout=5000, state="visible")
+            page.click(sel)
+            time.sleep(0.5)
+            page.fill(sel, password)
+            time.sleep(0.5)
+            if page.input_value(sel):
+                print(f"   ✓ Password filled ({sel})")
+                password_filled = True
+                break
+        except:
+            continue
+    if not password_filled:
+        raise Exception("❌ Could not fill password field")
+
+    # Click Log in button
+    login_selectors = [
+        'button[data-testid="login-button"]',
+        'button:has-text("Log in")',
+        'button[type="submit"]',
+    ]
+    for sel in login_selectors:
+        try:
+            page.wait_for_selector(sel, timeout=5000, state="visible")
+            page.click(sel)
+            print(f"   ✓ Clicked Log in ({sel})")
+            break
+        except:
+            continue
+
+    # Wait for successful redirect
+    try:
+        page.wait_for_url(
+            lambda url: "accounts.spotify.com/en/login" not in url,
+            timeout=15000
+        )
+    except:
+        print("   ⚠️ Redirect timeout — checking current URL...")
+
+    time.sleep(2)
+    print(f"   ✅ Login complete — URL: {page.url[:80]}")
 
 # ============================================================
 #  SCRAPE ALL PLAYLISTS FROM ONE PROFILE

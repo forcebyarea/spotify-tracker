@@ -11,7 +11,7 @@ from playwright.sync_api import sync_playwright
 #  SETTINGS — only edit SPREADSHEET_ID
 # ============================================================
 
-SPREADSHEET_ID     = "YOUR_GOOGLE_SHEET_ID_HERE"
+SPREADSHEET_ID     = "1dIjl5darXJ678ftBALLK-vqWkXopWRryvUlPGRdLJ9Q"
 PROFILE_DUMP_SHEET = "profile link dump"
 PLAYLIST_OUT_SHEET = "playlist urls"
 

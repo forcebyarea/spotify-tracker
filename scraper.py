@@ -7,10 +7,7 @@ from datetime import datetime
 from google.oauth2.service_account import Credentials
 
 # ============================================================
-#  SPOTIFY FOLLOWER TRACKER
-#  - Multi API key rotation
-#  - Reliable column detection
-#  - No formatting on empty columns
+#  SPOTIFY FOLLOWER TRACKER — SIMPLE RELIABLE VERSION
 # ============================================================
 
 SCOPES = [
@@ -65,7 +62,7 @@ class SpotifyTokenManager:
             token = self._fetch_token(self.current_index)
             if token:
                 self.tokens[self.current_index] = token
-                print(f'   ✅ Token from credential {self.current_index + 1}/{len(self.credentials)}')
+                print(f'   ✅ Token from credential {self.current_index + 1}')
             else:
                 return self._rotate()
         return self.tokens.get(self.current_index)
@@ -78,7 +75,7 @@ class SpotifyTokenManager:
             if token:
                 self.current_index = next_index
                 self.tokens[next_index] = token
-                print(f'   ✅ Token from credential {next_index + 1}/{len(self.credentials)}')
+                print(f'   ✅ Token from credential {next_index + 1}')
                 return token
             next_index += 1
         print('   ❌ All credentials exhausted')
@@ -93,7 +90,8 @@ class SpotifyTokenManager:
 # ── Google Sheets ────────────────────────────────────────────
 
 def get_gspread_client():
-    creds_dict = json.loads(os.environ['GOOGLE_CREDENTIALS'])
+    creds_json = os.environ['GOOGLE_CREDENTIALS']
+    creds_dict = json.loads(creds_json)
     creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     return gspread.authorize(creds)
 
@@ -141,31 +139,32 @@ def extract_playlist_id(url):
 # ── Sheet logic ──────────────────────────────────────────────
 
 def find_or_create_column(sheet, today_str):
-    """
-    Reliably find or create today's column.
-    Uses row_values with include_tailing_empty=False then checks actual sheet col count.
-    """
-    # Read row 2 directly — this gives us all headers including recently added ones
+    # Read row 2 directly to find headers
     row2 = sheet.row_values(2)
+    print(f'   📊 Row 2 has {len(row2)} columns')
 
-    # Search for today's header
+    # Check if today already exists
     for i, h in enumerate(row2):
         if today_str in str(h):
             print(f'   📅 Today column already exists at col {i+1}')
-            return i + 1, False  # col_index, is_new
+            return i + 1
 
-    # Find the true last column with data in row 2
-    last_data_col = len(row2)  # row_values strips trailing empty, so this is accurate
-    new_col = last_data_col + 1
+    # Find last non-empty column in row 2
+    last_col = 0
+    for i, h in enumerate(row2):
+        if str(h).strip():
+            last_col = i + 1
 
-    print(f'   📅 New column at index {new_col} for {today_str}')
+    new_col = last_col + 1
+    print(f'   📅 New column at {new_col}')
 
     # Expand sheet if needed
     sheet_meta = sheet.spreadsheet.fetch_sheet_metadata()
     for s in sheet_meta['sheets']:
         if s['properties']['sheetId'] == sheet.id:
             current_cols = s['properties']['gridProperties']['columnCount']
-            if new_col > current_cols:
+            print(f'   📊 Sheet has {current_cols} columns, need {new_col}')
+            if new_col >= current_cols:
                 sheet.spreadsheet.batch_update({
                     'requests': [{
                         'appendDimension': {
@@ -175,37 +174,37 @@ def find_or_create_column(sheet, today_str):
                         }
                     }]
                 })
-                print(f'   📐 Expanded sheet by 50 columns')
+                print(f'   📐 Expanded columns by 50')
             break
 
-    # Write header
+    # Write today's header
     sheet.update_cell(2, new_col, today_str)
-    return new_col, True  # col_index, is_new
+    print(f'   ✅ Header written at col {new_col}')
+    return new_col
 
 
 def process_followers_sheet(sheet, token_manager, today_str):
-    print(f'   📋 Processing: {sheet.title}')
+    print(f'\n   📋 Processing: {sheet.title}')
 
-    # Read all data once
+    # Read all data
     all_values = sheet.get_all_values()
     if len(all_values) < 3:
         print(f'   ⚠️ Not enough rows — skipping')
         return
 
-    # Get column index for today
-    col_index, is_new_col = find_or_create_column(sheet, today_str)
-    print(f'   📊 Writing to column {col_index} ({"new" if is_new_col else "existing"})')
+    # Get today's column
+    col_index = find_or_create_column(sheet, today_str)
+    print(f'   📝 Writing to column {col_index}')
 
-    updates       = []
-    color_updates = []
-    count         = 0
+    written = 0
+    skipped = 0
 
     for row_idx in range(2, len(all_values)):
         row = all_values[row_idx]
         if len(row) < 2:
             continue
 
-        playlist_url = row[1].strip() if len(row) > 1 else ''
+        playlist_url = str(row[1]).strip()
         if not playlist_url or 'spotify' not in playlist_url:
             continue
 
@@ -214,63 +213,62 @@ def process_followers_sheet(sheet, token_manager, today_str):
             continue
 
         followers = get_playlist_followers(playlist_id, token_manager)
-        if followers is None:
-            time.sleep(DELAY_BETWEEN_REQUESTS)
-            continue
-
-        count += 1
-        sheet_row = row_idx + 1  # 1-based
-
-        updates.append({
-            'range': gspread.utils.rowcol_to_a1(sheet_row, col_index),
-            'values': [[followers]]
-        })
-
-        # Only colour if we have a previous value to compare
-        prev_followers = None
-        if col_index > 3:
-            try:
-                prev_val = row[col_index - 2] if len(row) >= col_index - 1 else ''
-                if str(prev_val).strip():
-                    prev_followers = int(str(prev_val).replace(',', ''))
-            except:
-                pass
-
-        if prev_followers is not None:
-            if followers > prev_followers:
-                color = {'red': 1, 'green': 0.95, 'blue': 0.2}   # yellow
-            elif followers < prev_followers:
-                color = {'red': 1, 'green': 0.4, 'blue': 0.4}    # red
-            else:
-                color = {'red': 1, 'green': 1, 'blue': 1}         # white
-            color_updates.append({'row': sheet_row, 'col': col_index, 'color': color})
-
         time.sleep(DELAY_BETWEEN_REQUESTS)
 
-    # Batch write follower counts
-    if updates:
-        sheet.batch_update(updates)
-        print(f'   ✅ Wrote {count} follower counts to column {col_index}')
-    else:
-        print(f'   ⚠️ No data written — check playlist URLs in column B')
+        if followers is None:
+            skipped += 1
+            continue
 
-    # Apply colours only to cells that have data
-    if color_updates:
-        requests_body = [{
-            'repeatCell': {
-                'range': {
-                    'sheetId':          sheet.id,
-                    'startRowIndex':    cu['row'] - 1,
-                    'endRowIndex':      cu['row'],
-                    'startColumnIndex': cu['col'] - 1,
-                    'endColumnIndex':   cu['col']
-                },
-                'cell': {'userEnteredFormat': {'backgroundColor': cu['color']}},
-                'fields': 'userEnteredFormat.backgroundColor'
-            }
-        } for cu in color_updates]
-        sheet.spreadsheet.batch_update({'requests': requests_body})
-        print(f'   🎨 Applied colours to {len(color_updates)} cells')
+        sheet_row = row_idx + 1  # 1-based
+
+        # Write directly cell by cell (most reliable)
+        try:
+            sheet.update_cell(sheet_row, col_index, followers)
+            written += 1
+
+            # Apply colour
+            prev_followers = None
+            if col_index > 3 and len(row) >= col_index - 1:
+                try:
+                    prev_val = row[col_index - 2]
+                    if prev_val:
+                        prev_followers = int(str(prev_val).replace(',', ''))
+                except:
+                    pass
+
+            if prev_followers is not None:
+                if followers > prev_followers:
+                    color = {'red': 1, 'green': 0.95, 'blue': 0.2}
+                elif followers < prev_followers:
+                    color = {'red': 1, 'green': 0.4, 'blue': 0.4}
+                else:
+                    color = {'red': 1, 'green': 1, 'blue': 1}
+            else:
+                color = {'red': 1, 'green': 1, 'blue': 1}
+
+            sheet.spreadsheet.batch_update({
+                'requests': [{
+                    'repeatCell': {
+                        'range': {
+                            'sheetId': sheet.id,
+                            'startRowIndex': sheet_row - 1,
+                            'endRowIndex': sheet_row,
+                            'startColumnIndex': col_index - 1,
+                            'endColumnIndex': col_index
+                        },
+                        'cell': {'userEnteredFormat': {'backgroundColor': color}},
+                        'fields': 'userEnteredFormat.backgroundColor'
+                    }
+                }]
+            })
+
+            if written % 10 == 0:
+                print(f'   ✍️  Written {written} so far...')
+
+        except Exception as e:
+            print(f'   ❌ Write error row {sheet_row}: {e}')
+
+    print(f'   ✅ Done: {written} written, {skipped} skipped')
 
 
 # ── Main ─────────────────────────────────────────────────────

@@ -99,8 +99,27 @@ def get_or_create_column(sheet, today_str):
         if today_str in str(h):
             return i + 1  # 1-based
 
-    # Add new column at the end
+    # New column index
     new_col = len(headers) + 1
+
+    # Expand sheet columns if needed (add 50 extra columns as buffer)
+    props = sheet.spreadsheet.fetch_sheet_metadata()
+    for s in props['sheets']:
+        if s['properties']['sheetId'] == sheet.id:
+            current_cols = s['properties']['gridProperties']['columnCount']
+            if new_col >= current_cols:
+                sheet.spreadsheet.batch_update({
+                    'requests': [{
+                        'appendDimension': {
+                            'sheetId': sheet.id,
+                            'dimension': 'COLUMNS',
+                            'length': 50
+                        }
+                    }]
+                })
+                print(f'   📐 Expanded sheet columns by 50')
+            break
+
     sheet.update_cell(2, new_col, today_str)
     return new_col
 

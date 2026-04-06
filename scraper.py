@@ -1,231 +1,252 @@
+import os
+import json
+import time
 import gspread
 import requests
-import time
-import json
-import os
-import re
 from datetime import datetime
 from google.oauth2.service_account import Credentials
 
 # ============================================================
-#  SETTINGS
+#  SPOTIFY FOLLOWER TRACKER
+#  Reads playlist URLs from all _Followers tabs in a sheet
+#  Fetches follower counts from Spotify
+#  Writes data back to the sheet
 # ============================================================
 
-SPREADSHEET_ID     = "1dIjl5darXJ678ftBALLK-vqWkXopWRryvUlPGRdLJ9Q"
-PLAYLIST_TAB       = "playlist urls"   # written by playlist_discoverer.py
-DELAY              = 1.5
+SCOPES = [
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/drive'
+]
 
-# ============================================================
-#  GET SPOTIFY TOKEN
-# ============================================================
+DELAY_BETWEEN_REQUESTS = 1  # seconds between Spotify API calls
+MAX_RETRIES = 3              # retries on 429 rate limit
+
+
+# ── Auth ────────────────────────────────────────────────────
 
 def get_spotify_token():
-    print("🔑 Getting Spotify token...")
-    client_id     = os.environ.get("SPOTIFY_CLIENT_ID")
-    client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET")
+    client_id     = os.environ['SPOTIFY_CLIENT_ID']
+    client_secret = os.environ['SPOTIFY_CLIENT_SECRET']
 
-    if not client_id or not client_secret:
-        raise Exception("❌ SPOTIFY_CLIENT_ID or SPOTIFY_CLIENT_SECRET missing in GitHub Secrets")
-
-    import base64
-    resp = requests.post(
-        "https://accounts.spotify.com/api/token",
-        data={"grant_type": "client_credentials"},
-        headers={"Authorization": "Basic " + base64.b64encode(
-            f"{client_id}:{client_secret}".encode()).decode()},
-        timeout=15
+    response = requests.post(
+        'https://accounts.spotify.com/api/token',
+        data={'grant_type': 'client_credentials'},
+        auth=(client_id, client_secret)
     )
-    if resp.status_code != 200:
-        raise Exception(f"❌ Token failed: {resp.status_code}")
-    print("   ✅ Token obtained")
-    return resp.json().get("access_token")
+    if response.status_code != 200:
+        raise Exception(f'Spotify token failed: {response.text}')
+    
+    token = response.json().get('access_token')
+    print(f'   ✅ Spotify token obtained')
+    return token
 
-# ============================================================
-#  CONNECT TO GOOGLE SHEETS
-# ============================================================
 
-def connect_to_sheets():
-    print("🔗 Connecting to Google Sheets...")
-    creds_json = os.environ.get("GOOGLE_CREDENTIALS")
-    if creds_json:
-        creds = Credentials.from_service_account_info(
-            json.loads(creds_json),
-            scopes=["https://spreadsheets.google.com/feeds",
-                    "https://www.googleapis.com/auth/drive"]
-        )
-    else:
-        creds = Credentials.from_service_account_file(
-            "service_account.json",
-            scopes=["https://spreadsheets.google.com/feeds",
-                    "https://www.googleapis.com/auth/drive"]
-        )
-    client = gspread.authorize(creds)
-    ss     = client.open_by_key(SPREADSHEET_ID)
-    print("   ✅ Connected")
-    return ss
+def get_gspread_client():
+    creds_json = os.environ['GOOGLE_CREDENTIALS']
+    creds_dict = json.loads(creds_json)
+    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    return gspread.authorize(creds)
 
-# ============================================================
-#  READ PLAYLIST URLS FROM DISCOVERER TAB
-#  Reads column B (playlist URL) and column C (owner/profile)
-# ============================================================
 
-def get_playlists(spreadsheet):
-    print("📋 Reading playlist URLs...")
+# ── Spotify ─────────────────────────────────────────────────
+
+def get_playlist_followers(playlist_id, token):
+    url = f'https://api.spotify.com/v1/playlists/{playlist_id}'
+    headers = {'Authorization': f'Bearer {token}'}
+    params  = {'fields': 'followers.total,name'}
+
+    for attempt in range(MAX_RETRIES):
+        response = requests.get(url, headers=headers, params=params)
+
+        if response.status_code == 200:
+            data = response.json()
+            return data.get('followers', {}).get('total', 0)
+
+        elif response.status_code == 429:
+            retry_after = int(response.headers.get('Retry-After', 5))
+            print(f'   ⏳ Rate limited. Waiting {retry_after}s...')
+            time.sleep(retry_after)
+
+        elif response.status_code == 401:
+            print(f'   ❌ Token expired for playlist {playlist_id}')
+            return None
+
+        else:
+            print(f'   ⚠️ Status {response.status_code} for {playlist_id}')
+            return None
+
+    return None
+
+
+def extract_playlist_id(url):
+    # Handles: https://open.spotify.com/playlist/37i9dQZF1DX...
     try:
-        sheet = spreadsheet.worksheet(PLAYLIST_TAB)
-    except gspread.WorksheetNotFound:
-        print(f"   ❌ '{PLAYLIST_TAB}' tab not found.")
-        print("   Run playlist_discoverer.py first to populate this tab.")
-        return {}
+        if '/playlist/' in url:
+            return url.split('/playlist/')[1].split('?')[0].strip()
+    except:
+        pass
+    return None
 
-    rows = sheet.get_all_values()
-    # Group by profile URL (column D)
-    profile_to_playlists = {}
-    for row in rows[1:]:
-        if len(row) < 2 or not row[1]:
+
+# ── Sheet logic ──────────────────────────────────────────────
+
+def get_or_create_column(sheet, today_str):
+    """Find today's column or create a new one. Returns column index (1-based)."""
+    headers = sheet.row_values(2)  # Row 2 has date headers
+
+    # Check if today's column already exists
+    for i, h in enumerate(headers):
+        if today_str in str(h):
+            return i + 1  # 1-based
+
+    # Add new column at the end
+    new_col = len(headers) + 1
+    sheet.update_cell(2, new_col, today_str)
+    return new_col
+
+
+def process_followers_sheet(sheet, token, today_str):
+    print(f'   📋 Processing: {sheet.title}')
+
+    all_values = sheet.get_all_values()
+    if len(all_values) < 3:
+        print(f'   ⚠️ Not enough rows — skipping')
+        return
+
+    # Find today's column
+    col_index = get_or_create_column(sheet, today_str)
+
+    # Process each playlist row (rows 3 onwards, index 2+)
+    updates      = []
+    color_updates = []
+
+    for row_idx in range(2, len(all_values)):  # 0-based, row 3 = index 2
+        row = all_values[row_idx]
+
+        if len(row) < 2:
             continue
-        name        = row[0].strip() if row[0] else "Unknown"
-        url         = row[1].strip()
-        owner_id    = row[2].strip() if len(row) > 2 else ""
-        profile_url = row[3].strip() if len(row) > 3 else "Unknown"
 
-        if "/playlist/" not in url:
+        playlist_url = row[1].strip() if len(row) > 1 else ''
+        if not playlist_url or 'spotify' not in playlist_url:
             continue
 
-        if profile_url not in profile_to_playlists:
-            profile_to_playlists[profile_url] = []
-        profile_to_playlists[profile_url].append({
-            "name":     name,
-            "url":      url,
-            "owner_id": owner_id
+        playlist_id = extract_playlist_id(playlist_url)
+        if not playlist_id:
+            continue
+
+        followers = get_playlist_followers(playlist_id, token)
+        if followers is None:
+            time.sleep(DELAY_BETWEEN_REQUESTS)
+            continue
+
+        sheet_row = row_idx + 1  # 1-based
+        updates.append({
+            'range': gspread.utils.rowcol_to_a1(sheet_row, col_index),
+            'values': [[followers]]
         })
 
-    total = sum(len(v) for v in profile_to_playlists.values())
-    print(f"   Found {total} playlists across {len(profile_to_playlists)} profiles")
-    return profile_to_playlists
-
-# ============================================================
-#  GET FOLLOWER COUNT FOR ONE PLAYLIST
-# ============================================================
-
-def get_followers(playlist_url, token):
-    pid     = re.search(r"/playlist/([^/?]+)", playlist_url)
-    if not pid:
-        return 0
-    url     = f"https://api.spotify.com/v1/playlists/{pid.group(1)}?fields=followers,name"
-    headers = {"Authorization": f"Bearer {token}"}
-    try:
-        resp = requests.get(url, headers=headers, timeout=15)
-        if resp.status_code == 429:
-            wait = int(resp.headers.get("Retry-After", 3))
-            time.sleep(wait)
-            resp = requests.get(url, headers=headers, timeout=15)
-        if resp.status_code != 200:
-            return 0
-        f = resp.json().get("followers", {})
-        return f.get("total", 0) if isinstance(f, dict) else int(f or 0)
-    except:
-        return 0
-
-# ============================================================
-#  WRITE TO _Followers SHEET
-# ============================================================
-
-def update_sheet(spreadsheet, profile_url, display_name, playlists):
-    clean      = re.sub(r'[^a-zA-Z0-9]', '_', display_name)
-    sheet_name = clean + "_Followers"
-
-    try:
-        sheet = spreadsheet.worksheet(sheet_name)
-    except gspread.WorksheetNotFound:
-        sheet = spreadsheet.add_worksheet(title=sheet_name, rows=500, cols=100)
-
-    data = sheet.get_all_values()
-
-    if not data or len(data) < 2:
-        sheet.update(values=[["Profile Name", display_name, profile_url]], range_name="A1:C1")
-        sheet.format("A1:C1", {"textFormat": {"bold": True}})
-        sheet.update(values=[["Playlist Name", "Playlist URL"]], range_name="A2:B2")
-        sheet.format("A2:B2", {"textFormat": {"bold": True}})
-        data = sheet.get_all_values()
-
-    today     = datetime.now().strftime("%d %b %H:%M")
-    last_col  = len(data[1]) if len(data) > 1 else 2
-    new_col   = last_col + 1
-
-    sheet.update_cell(2, new_col, today)
-    sheet.format(gspread.utils.rowcol_to_a1(2, new_col), {"textFormat": {"bold": True}})
-
-    url_to_row   = {row[1].strip(): i + 3 for i, row in enumerate(data[2:]) if len(row) > 1 and row[1]}
-    next_new_row = len(data) + 1
-
-    for pl in playlists:
-        clean_url = pl["url"].split("?")[0]
-        row_num   = url_to_row.get(clean_url, next_new_row)
-        if clean_url not in url_to_row:
-            url_to_row[clean_url] = next_new_row
-            next_new_row += 1
-
-        sheet.update_cell(row_num, 1, pl["name"])
-        sheet.update_cell(row_num, 2, clean_url)
-        sheet.update_cell(row_num, new_col, pl["followers"])
-
-        if new_col > 3:
+        # Determine colour based on previous column
+        prev_followers = None
+        if col_index > 3 and len(row) >= col_index - 1:
             try:
-                prev = sheet.cell(row_num, new_col - 1).value
-                if prev and str(prev).strip().lstrip('-').isdigit():
-                    diff  = pl["followers"] - int(prev)
-                    color = ({"red":1.0,"green":1.0,"blue":0.0} if diff > 0 else
-                             {"red":1.0,"green":0.2,"blue":0.2} if diff < 0 else
-                             {"red":1.0,"green":1.0,"blue":1.0})
-                    sheet.format(gspread.utils.rowcol_to_a1(row_num, new_col), {"backgroundColor": color})
+                prev_val = row[col_index - 2]
+                if prev_val:
+                    prev_followers = int(str(prev_val).replace(',', ''))
             except:
                 pass
 
-    # Sort by latest followers descending
-    all_data = sheet.get_all_values()
-    if len(all_data) > 3:
-        rows = all_data[2:]
-        sorted_rows = sorted(rows,
-            key=lambda r: int(r[new_col-1]) if len(r) >= new_col and str(r[new_col-1]).strip().lstrip('-').isdigit() else 0,
-            reverse=True)
-        if sorted_rows != rows:
-            sheet.update(values=sorted_rows, range_name=f"A3:{gspread.utils.rowcol_to_a1(2+len(sorted_rows), new_col)}")
+        if prev_followers is not None:
+            if followers > prev_followers:
+                color = {'red': 1, 'green': 0.95, 'blue': 0.2}   # yellow
+            elif followers < prev_followers:
+                color = {'red': 1, 'green': 0.4, 'blue': 0.4}    # red
+            else:
+                color = {'red': 1, 'green': 1, 'blue': 1}         # white
+        else:
+            color = {'red': 1, 'green': 1, 'blue': 1}
 
-    print(f"   ✅ {len(playlists)} playlists → {sheet_name}")
+        color_updates.append({
+            'row': sheet_row,
+            'col': col_index,
+            'color': color
+        })
 
-# ============================================================
-#  MAIN
-# ============================================================
+        time.sleep(DELAY_BETWEEN_REQUESTS)
+
+    # Batch write all follower counts at once
+    if updates:
+        sheet.batch_update(updates)
+        print(f'   ✅ Wrote {len(updates)} follower counts')
+
+    # Apply colours
+    spreadsheet = sheet.spreadsheet
+    requests_body = []
+    for cu in color_updates:
+        requests_body.append({
+            'repeatCell': {
+                'range': {
+                    'sheetId': sheet.id,
+                    'startRowIndex': cu['row'] - 1,
+                    'endRowIndex':   cu['row'],
+                    'startColumnIndex': cu['col'] - 1,
+                    'endColumnIndex':   cu['col']
+                },
+                'cell': {
+                    'userEnteredFormat': {
+                        'backgroundColor': cu['color']
+                    }
+                },
+                'fields': 'userEnteredFormat.backgroundColor'
+            }
+        })
+
+    if requests_body:
+        spreadsheet.batch_update({'requests': requests_body})
+        print(f'   🎨 Applied colours')
+
+
+# ── Main ─────────────────────────────────────────────────────
 
 def main():
-    print("=" * 55)
-    print("  SPOTIFY FOLLOWER TRACKER")
-    print(f"  Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 55)
+    today_str  = datetime.now().strftime('%d %b %Y')
+    sheet_ids  = json.loads(os.environ['SHEET_IDS'])
+    sheet_index = int(os.environ.get('SHEET_INDEX', '0'))
+    sheet_id   = sheet_ids[sheet_index]
 
-    token               = get_spotify_token()
-    spreadsheet         = connect_to_sheets()
-    profile_to_playlists = get_playlists(spreadsheet)
+    print(f'''
+=======================================================
+  SPOTIFY FOLLOWER TRACKER
+  Sheet {sheet_index + 1} of {len(sheet_ids)}
+  Sheet ID: {sheet_id}
+  Date: {today_str}
+=======================================================''')
 
-    if not profile_to_playlists:
-        print("❌ No playlists to track. Run playlist_discoverer.py first.")
-        return
+    print('🔑 Getting Spotify token...')
+    token = get_spotify_token()
 
-    for i, (profile_url, playlists) in enumerate(profile_to_playlists.items(), 1):
-        display_name = playlists[0]["owner_id"] if playlists else profile_url
-        print(f"\n[{i}/{len(profile_to_playlists)}] 👤 {display_name} — {len(playlists)} playlists")
+    print('🔗 Connecting to Google Sheets...')
+    gc = get_gspread_client()
+    spreadsheet = gc.open_by_key(sheet_id)
+    print(f'   ✅ Connected to: {spreadsheet.title}')
 
-        for j, pl in enumerate(playlists, 1):
-            pl["followers"] = get_followers(pl["url"], token)
-            print(f"   [{j}/{len(playlists)}] {pl['name']}: {pl['followers']:,}")
-            time.sleep(DELAY)
+    # Find all _Followers tabs
+    follower_sheets = [
+        s for s in spreadsheet.worksheets()
+        if s.title.endswith('_Followers')
+    ]
+    print(f'📋 Found {len(follower_sheets)} _Followers tabs')
 
-        update_sheet(spreadsheet, profile_url, display_name, playlists)
+    for sheet in follower_sheets:
+        try:
+            process_followers_sheet(sheet, token, today_str)
+        except Exception as e:
+            print(f'   ❌ Error on {sheet.title}: {e}')
 
-    print("\n" + "=" * 55)
-    print(f"  ✅ Done! — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 55)
+    print(f'''
+=======================================================
+  ✅ Sheet {sheet_index + 1} complete!
+=======================================================''')
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()

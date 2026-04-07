@@ -38,6 +38,7 @@ class SpotifyTokenManager:
         self.current_index = 0
         self.tokens = {}
         self.request_counts = [0] * len(self.credentials)
+        self.rate_limited_until = {}  # key_index -> timestamp when ban lifts
         print(f'   🔑 Loaded {len(self.credentials)} Spotify credentials')
 
     def _load_credentials(self):
@@ -69,7 +70,40 @@ class SpotifyTokenManager:
             pass
         return None
 
+    def _is_rate_limited(self, index):
+        if index in self.rate_limited_until:
+            remaining = self.rate_limited_until[index] - time.time()
+            if remaining > 0:
+                mins = int(remaining // 60)
+                secs = int(remaining % 60)
+                print(f'   ⏳ Key {index+1} still banned — {mins}m {secs}s remaining')
+                return True
+            else:
+                # Ban lifted
+                del self.rate_limited_until[index]
+        return False
+
+    def print_key_status(self):
+        print(f'\n   📊 API Key Status:')
+        for i in range(len(self.credentials)):
+            if i in self.rate_limited_until:
+                remaining = self.rate_limited_until[i] - time.time()
+                if remaining > 0:
+                    mins = int(remaining // 60)
+                    secs = int(remaining % 60)
+                    print(f'      Key {i+1}: 🔴 Banned — {mins}m {secs}s left')
+                else:
+                    print(f'      Key {i+1}: 🟢 Available (ban just lifted)')
+            elif i == self.current_index:
+                print(f'      Key {i+1}: 🟢 Active ({self.request_counts[i]} requests)')
+            else:
+                print(f'      Key {i+1}: 🟡 Standby ({self.request_counts[i]} requests)')
+
     def get_token(self):
+        # Skip if current key is rate limited
+        if self._is_rate_limited(self.current_index):
+            return self._rotate()
+
         if self.current_index not in self.tokens:
             token = self._fetch_token(self.current_index)
             if token:
@@ -80,10 +114,14 @@ class SpotifyTokenManager:
         return self.tokens.get(self.current_index)
 
     def _rotate(self):
-        # Try every other key
         start = self.current_index
         for offset in range(1, len(self.credentials)):
             next_index = (start + offset) % len(self.credentials)
+
+            # Skip banned keys
+            if self._is_rate_limited(next_index):
+                continue
+
             print(f'   🔄 Switching to key {next_index + 1}/{len(self.credentials)}...')
             token = self._fetch_token(next_index)
             if token:
@@ -91,15 +129,40 @@ class SpotifyTokenManager:
                 self.tokens[next_index] = token
                 print(f'   ✅ Token from key {next_index + 1}/{len(self.credentials)}')
                 return token
-        print('   ❌ All keys exhausted or rate limited')
+
+        # All keys banned — find the one with shortest remaining ban
+        self.print_key_status()
+        soonest_index = None
+        soonest_time = float('inf')
+        for idx, until in self.rate_limited_until.items():
+            remaining = until - time.time()
+            if remaining < soonest_time:
+                soonest_time = remaining
+                soonest_index = idx
+
+        if soonest_index is not None and soonest_time > 0:
+            mins = int(soonest_time // 60)
+            secs = int(soonest_time % 60)
+            print(f'   😴 All keys banned — waiting {mins}m {secs}s for key {soonest_index+1} to recover...')
+            time.sleep(soonest_time + 1)
+            del self.rate_limited_until[soonest_index]
+            if soonest_index in self.tokens:
+                del self.tokens[soonest_index]
+            self.current_index = soonest_index
+            return self.get_token()
+
+        print('   ❌ All keys exhausted')
         return None
 
     def handle_rate_limit(self, wait_seconds):
-        # Clear current key token and rotate immediately
-        # Don't wait the full Retry-After — just switch keys
-        print(f'   ⚡ Rate limit hit on key {self.current_index + 1} — rotating immediately')
-        if self.current_index in self.tokens:
-            del self.tokens[self.current_index]
+        idx = self.current_index
+        ban_until = time.time() + wait_seconds
+        self.rate_limited_until[idx] = ban_until
+        mins = int(wait_seconds // 60)
+        secs = int(wait_seconds % 60)
+        print(f'   ⚡ Key {idx+1} rate limited for {mins}m {secs}s — rotating immediately')
+        if idx in self.tokens:
+            del self.tokens[idx]
         return self._rotate()
 
     def handle_401(self):
@@ -109,12 +172,13 @@ class SpotifyTokenManager:
 
     def increment(self):
         self.request_counts[self.current_index] += 1
-        # Proactively rotate every 200 requests to spread load
+        # Print status every 100 requests
+        if self.request_counts[self.current_index] % 100 == 0:
+            self.print_key_status()
+        # Proactively rotate every 200 requests
         if self.request_counts[self.current_index] % 200 == 0:
             print(f'   🔄 Proactive rotation after 200 requests on key {self.current_index + 1}')
             self._rotate()
-
-
 # ── Google Sheets ────────────────────────────────────────────
 
 def get_gspread_client():

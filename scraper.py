@@ -5,6 +5,7 @@ import gspread
 import requests
 from datetime import datetime
 import pytz
+from google.oauth2.service_account import Credentials
 
 # ============================================================
 #  SPOTIFY FOLLOWER TRACKER — FULL UPDATE

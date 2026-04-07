@@ -2,7 +2,7 @@ name: Spotify Follower Tracker
 
 on:
   schedule:
-    - cron: '0 1 * * *'  # Runs every night at 1:00 AM UTC
+    - cron: '0 1 * * *'  # Runs every night at 1:00 AM UTC (6:30 AM IST)
   workflow_dispatch:      # Allow manual runs
 
 jobs:
@@ -18,5 +18,6 @@ jobs:
         env:
           SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
           SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+          SPOTIFY_CREDENTIALS: ${{ secrets.SPOTIFY_CREDENTIALS }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           SHEET_IDS: ${{ secrets.SHEET_IDS }}

@@ -25,7 +25,7 @@ SCOPES = [
 # Spotify allows ~180 req/min per key
 # With 6 keys rotating = effectively 6x capacity
 # Safe delay = 1s per request (well under limit for any single key)
-DELAY_BETWEEN_REQUESTS = 1
+DELAY_BETWEEN_REQUESTS = 2
 DELAY_BETWEEN_SHEETS   = 15
 MAX_RETRIES            = 6  # one retry per key
 
@@ -42,11 +42,13 @@ class SpotifyTokenManager:
         print(f'   🔑 Loaded {len(self.credentials)} Spotify credentials')
 
     def _load_credentials(self):
-        multi = os.environ.get('SPOTIFY_CREDENTIALS')
+        multi = os.environ.get("SPOTIFY_CREDENTIALS")
+        print(f"   🔍 SPOTIFY_CREDENTIALS present: {bool(multi)}")
         if multi:
             try:
                 creds = json.loads(multi)
                 if isinstance(creds, list) and len(creds) > 0:
+                    print(f"   🔍 Parsed {len(creds)} credentials from JSON")
                     return creds
             except:
                 pass

@@ -4,16 +4,15 @@ import time
 import gspread
 import requests
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import pytz
 from google.oauth2.service_account import Credentials
 
 # ============================================================
-#  SPOTIFY FOLLOWER TRACKER — PARALLEL + FAST VERSION
-#  - Concurrent Spotify requests (5 at a time)
-#  - Batch writes to Google Sheets
+#  SPOTIFY FOLLOWER TRACKER — STABLE VERSION
+#  - Sequential requests (no threading — caused token issues)
+#  - Staggered start to avoid Google Sheets rate limit
+#  - Batch writes for speed
 #  - 1 dedicated API key per job
-#  - Skips Link Sheet 2
 # ============================================================
 
 SCOPES = [
@@ -21,7 +20,6 @@ SCOPES = [
     'https://www.googleapis.com/auth/drive'
 ]
 
-CONCURRENT_REQUESTS = 5  # fetch 5 playlists at once
 MAX_RETRIES = 3
 
 
@@ -49,9 +47,7 @@ def get_gspread_client():
 
 # ── Spotify Data ─────────────────────────────────────────────
 
-def fetch_single_playlist(args):
-    playlist_id, token, client_id, client_secret, row_idx, prev_followers = args
-
+def get_playlist_followers(playlist_id, token, client_id, client_secret):
     url    = f'https://api.spotify.com/v1/playlists/{playlist_id}'
     params = {'fields': 'followers.total'}
 
@@ -65,30 +61,29 @@ def fetch_single_playlist(args):
             )
 
             if r.status_code == 200:
-                followers = r.json().get('followers', {}).get('total', 0)
-                return (row_idx, followers, prev_followers, None)
+                return r.json().get('followers', {}).get('total', 0), token
 
             elif r.status_code == 429:
                 wait = int(r.headers.get('Retry-After', 30))
                 print(f'   ⏳ Rate limited — waiting {wait}s...')
                 time.sleep(wait)
-                # Refresh token and retry
+                token = get_spotify_token(client_id, client_secret)
+
+            elif r.status_code == 401:
+                print(f'   🔄 Token expired — refreshing...')
                 token = get_spotify_token(client_id, client_secret)
 
             elif r.status_code == 404:
-                return (row_idx, None, prev_followers, 'deleted')
-
-            elif r.status_code == 401:
-                token = get_spotify_token(client_id, client_secret)
+                return None, token
 
             else:
-                return (row_idx, None, prev_followers, f'status_{r.status_code}')
+                return None, token
 
         except Exception as e:
-            if attempt == MAX_RETRIES - 1:
-                return (row_idx, None, prev_followers, str(e))
+            print(f'   ⚠️ Request error: {e}')
+            time.sleep(2)
 
-    return (row_idx, None, prev_followers, 'max_retries')
+    return None, token
 
 
 def extract_playlist_id(url):
@@ -162,13 +157,14 @@ def process_followers_sheet(sheet, token, client_id, client_secret, today_str):
     existing = sheet.col_values(col_index)
     already_written = sum(1 for v in existing[2:] if v)
     if already_written > 0:
-        print(f'   ⏭️  Already tracked today ({already_written} values) — skipping')
+        print(f'   ⏭️  Already tracked ({already_written} values) — skipping')
         return token
 
-    print(f'   📝 Writing to column {col_index}')
+    print(f'   📝 Fetching followers for column {col_index}...')
 
-    # Build task list
-    tasks = []
+    follower_data = []
+    deleted       = []
+
     for row_idx in range(2, len(all_values)):
         row = all_values[row_idx]
         if len(row) < 2:
@@ -182,6 +178,14 @@ def process_followers_sheet(sheet, token, client_id, client_secret, today_str):
         if not playlist_id:
             continue
 
+        followers, token = get_playlist_followers(playlist_id, token, client_id, client_secret)
+
+        sheet_row = row_idx + 1
+
+        if followers is None:
+            deleted.append(sheet_row)
+            continue
+
         prev_followers = None
         if col_index > 3:
             try:
@@ -191,40 +195,21 @@ def process_followers_sheet(sheet, token, client_id, client_secret, today_str):
             except:
                 pass
 
-        tasks.append((playlist_id, token, client_id, client_secret, row_idx + 1, prev_followers))
+        follower_data.append((sheet_row, followers, prev_followers))
 
-    print(f'   🎯 Fetching {len(tasks)} playlists ({CONCURRENT_REQUESTS} at a time)...')
+        if len(follower_data) % 50 == 0:
+            print(f'   ✍️  {len(follower_data)} fetched so far...')
 
-    # Fetch concurrently
-    results = {}
-    deleted = []
-    completed = 0
+    print(f'   ✅ Fetched {len(follower_data)} | Skipped {len(deleted)}')
 
-    with ThreadPoolExecutor(max_workers=CONCURRENT_REQUESTS) as executor:
-        futures = {executor.submit(fetch_single_playlist, task): task for task in tasks}
-
-        for future in as_completed(futures):
-            row_idx, followers, prev_followers, error = future.result()
-            completed += 1
-
-            if followers is not None:
-                results[row_idx] = (followers, prev_followers)
-            elif error == 'deleted':
-                deleted.append(row_idx)
-
-            if completed % 50 == 0:
-                print(f'   ✍️  {completed}/{len(tasks)} fetched...')
-
-    print(f'   ✅ Fetched {len(results)} | Deleted/private: {len(deleted)}')
-
-    if not results:
+    if not follower_data:
         return token
 
-    # Batch write values
+    # Batch write all values at once
     value_updates = []
     color_requests = []
 
-    for sheet_row, (followers, prev_followers) in sorted(results.items()):
+    for sheet_row, followers, prev_followers in follower_data:
         value_updates.append({
             'range': gspread.utils.rowcol_to_a1(sheet_row, col_index),
             'values': [[followers]]
@@ -232,11 +217,11 @@ def process_followers_sheet(sheet, token, client_id, client_secret, today_str):
 
         if prev_followers is not None:
             if followers > prev_followers:
-                color = {'red': 1.0, 'green': 1.0, 'blue': 0.0}   # yellow
+                color = {'red': 1.0, 'green': 1.0, 'blue': 0.0}
             elif followers < prev_followers:
-                color = {'red': 1.0, 'green': 0.0, 'blue': 0.0}   # red
+                color = {'red': 1.0, 'green': 0.0, 'blue': 0.0}
             else:
-                color = {'red': 1.0, 'green': 1.0, 'blue': 1.0}   # white
+                color = {'red': 1.0, 'green': 1.0, 'blue': 1.0}
         else:
             color = {'red': 1.0, 'green': 1.0, 'blue': 1.0}
 
@@ -264,28 +249,33 @@ def process_followers_sheet(sheet, token, client_id, client_secret, today_str):
 # ── Main ─────────────────────────────────────────────────────
 
 def main():
-    ist = pytz.timezone('Asia/Kolkata')
-    now = datetime.now(ist)
-    today_str = now.strftime('%d %b %H:%M IST')
+    ist        = pytz.timezone('Asia/Kolkata')
+    now        = datetime.now(ist)
+    today_str  = now.strftime('%d %b %H:%M IST')
 
-    all_sheet_ids  = json.loads(os.environ['SHEET_IDS'])
-    sheet_indices  = json.loads(os.environ['SHEET_INDICES'])
-    all_creds      = json.loads(os.environ['SPOTIFY_CREDENTIALS'])
-    key_index      = int(os.environ['KEY_INDEX'])
-    cred           = all_creds[key_index]
-    client_id      = cred['id']
-    client_secret  = cred['secret']
+    all_sheet_ids = json.loads(os.environ['SHEET_IDS'])
+    sheet_indices = json.loads(os.environ['SHEET_INDICES'])
+    all_creds     = json.loads(os.environ['SPOTIFY_CREDENTIALS'])
+    key_index     = int(os.environ['KEY_INDEX'])
+    start_delay   = int(os.environ.get('START_DELAY', '0'))
 
-    my_sheets = [all_sheet_ids[i] for i in sheet_indices]
+    cred          = all_creds[key_index]
+    client_id     = cred['id']
+    client_secret = cred['secret']
+    my_sheets     = [all_sheet_ids[i] for i in sheet_indices]
 
     print(f'''
 =======================================================
   SPOTIFY FOLLOWER TRACKER
   Job sheets: {[i+1 for i in sheet_indices]}
   API key: {key_index + 1}/6
-  Concurrent requests: {CONCURRENT_REQUESTS}
   Date: {today_str}
 =======================================================''')
+
+    # Stagger start to avoid Google Sheets rate limit
+    if start_delay > 0:
+        print(f'⏸️  Waiting {start_delay}s before starting to avoid Google rate limit...')
+        time.sleep(start_delay)
 
     print('🔑 Getting Spotify token...')
     token = get_spotify_token(client_id, client_secret)

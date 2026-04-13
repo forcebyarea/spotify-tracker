@@ -21,6 +21,7 @@ jobs:
           SHEET_IDS: ${{ secrets.SHEET_IDS }}
           SHEET_INDICES: '[0,2,3]'
           KEY_INDEX: '0'
+          START_DELAY: '0'
 
   job-2:
     runs-on: ubuntu-latest
@@ -37,6 +38,7 @@ jobs:
           SHEET_IDS: ${{ secrets.SHEET_IDS }}
           SHEET_INDICES: '[4,5,6]'
           KEY_INDEX: '1'
+          START_DELAY: '30'
 
   job-3:
     runs-on: ubuntu-latest
@@ -53,6 +55,7 @@ jobs:
           SHEET_IDS: ${{ secrets.SHEET_IDS }}
           SHEET_INDICES: '[7,8,9]'
           KEY_INDEX: '2'
+          START_DELAY: '60'
 
   job-4:
     runs-on: ubuntu-latest
@@ -69,6 +72,7 @@ jobs:
           SHEET_IDS: ${{ secrets.SHEET_IDS }}
           SHEET_INDICES: '[10,11,12]'
           KEY_INDEX: '3'
+          START_DELAY: '90'
 
   job-5:
     runs-on: ubuntu-latest
@@ -85,6 +89,7 @@ jobs:
           SHEET_IDS: ${{ secrets.SHEET_IDS }}
           SHEET_INDICES: '[13,14,15]'
           KEY_INDEX: '4'
+          START_DELAY: '120'
 
   job-6:
     runs-on: ubuntu-latest
@@ -101,3 +106,4 @@ jobs:
           SHEET_IDS: ${{ secrets.SHEET_IDS }}
           SHEET_INDICES: '[16]'
           KEY_INDEX: '5'
+          START_DELAY: '150'

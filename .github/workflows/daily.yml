@@ -19,7 +19,7 @@ jobs:
           SPOTIFY_CREDENTIALS: ${{ secrets.SPOTIFY_CREDENTIALS }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           SHEET_IDS: ${{ secrets.SHEET_IDS }}
-          SHEET_INDICES: '[0,1,2]'
+          SHEET_INDICES: '[0,2,3]'
           KEY_INDEX: '0'
 
   job-2:
@@ -35,7 +35,7 @@ jobs:
           SPOTIFY_CREDENTIALS: ${{ secrets.SPOTIFY_CREDENTIALS }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           SHEET_IDS: ${{ secrets.SHEET_IDS }}
-          SHEET_INDICES: '[3,4,5]'
+          SHEET_INDICES: '[4,5,6]'
           KEY_INDEX: '1'
 
   job-3:
@@ -51,7 +51,7 @@ jobs:
           SPOTIFY_CREDENTIALS: ${{ secrets.SPOTIFY_CREDENTIALS }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           SHEET_IDS: ${{ secrets.SHEET_IDS }}
-          SHEET_INDICES: '[6,7,8]'
+          SHEET_INDICES: '[7,8,9]'
           KEY_INDEX: '2'
 
   job-4:
@@ -67,7 +67,7 @@ jobs:
           SPOTIFY_CREDENTIALS: ${{ secrets.SPOTIFY_CREDENTIALS }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           SHEET_IDS: ${{ secrets.SHEET_IDS }}
-          SHEET_INDICES: '[9,10,11]'
+          SHEET_INDICES: '[10,11,12]'
           KEY_INDEX: '3'
 
   job-5:
@@ -83,7 +83,7 @@ jobs:
           SPOTIFY_CREDENTIALS: ${{ secrets.SPOTIFY_CREDENTIALS }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           SHEET_IDS: ${{ secrets.SHEET_IDS }}
-          SHEET_INDICES: '[12,13,14]'
+          SHEET_INDICES: '[13,14,15]'
           KEY_INDEX: '4'
 
   job-6:
@@ -99,5 +99,5 @@ jobs:
           SPOTIFY_CREDENTIALS: ${{ secrets.SPOTIFY_CREDENTIALS }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           SHEET_IDS: ${{ secrets.SHEET_IDS }}
-          SHEET_INDICES: '[15,16]'
+          SHEET_INDICES: '[16]'
           KEY_INDEX: '5'

@@ -4,13 +4,16 @@ import time
 import gspread
 import requests
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pytz
 from google.oauth2.service_account import Credentials
 
 # ============================================================
-#  SPOTIFY FOLLOWER TRACKER — PARALLEL VERSION
-#  Each job handles specific sheets with its own dedicated key
-#  No rotation needed — 1 key per job, 1 IP per job
+#  SPOTIFY FOLLOWER TRACKER — PARALLEL + FAST VERSION
+#  - Concurrent Spotify requests (5 at a time)
+#  - Batch writes to Google Sheets
+#  - 1 dedicated API key per job
+#  - Skips Link Sheet 2
 # ============================================================
 
 SCOPES = [
@@ -18,6 +21,7 @@ SCOPES = [
     'https://www.googleapis.com/auth/drive'
 ]
 
+CONCURRENT_REQUESTS = 5  # fetch 5 playlists at once
 MAX_RETRIES = 3
 
 
@@ -35,10 +39,6 @@ def get_spotify_token(client_id, client_secret):
     return r.json().get('access_token')
 
 
-def refresh_token_if_needed(token, client_id, client_secret):
-    return get_spotify_token(client_id, client_secret)
-
-
 # ── Google Sheets ────────────────────────────────────────────
 
 def get_gspread_client():
@@ -49,39 +49,46 @@ def get_gspread_client():
 
 # ── Spotify Data ─────────────────────────────────────────────
 
-def get_playlist_followers(playlist_id, token, client_id, client_secret):
+def fetch_single_playlist(args):
+    playlist_id, token, client_id, client_secret, row_idx, prev_followers = args
+
     url    = f'https://api.spotify.com/v1/playlists/{playlist_id}'
     params = {'fields': 'followers.total'}
 
     for attempt in range(MAX_RETRIES):
-        r = requests.get(
-            url,
-            headers={'Authorization': f'Bearer {token}'},
-            params=params
-        )
+        try:
+            r = requests.get(
+                url,
+                headers={'Authorization': f'Bearer {token}'},
+                params=params,
+                timeout=10
+            )
 
-        if r.status_code == 200:
-            return r.json().get('followers', {}).get('total', 0), token
+            if r.status_code == 200:
+                followers = r.json().get('followers', {}).get('total', 0)
+                return (row_idx, followers, prev_followers, None)
 
-        elif r.status_code == 429:
-            wait = int(r.headers.get('Retry-After', 30))
-            mins = wait // 60
-            secs = wait % 60
-            print(f'   ⏳ Rate limited — waiting {mins}m {secs}s...')
-            time.sleep(wait)
+            elif r.status_code == 429:
+                wait = int(r.headers.get('Retry-After', 30))
+                print(f'   ⏳ Rate limited — waiting {wait}s...')
+                time.sleep(wait)
+                # Refresh token and retry
+                token = get_spotify_token(client_id, client_secret)
 
-        elif r.status_code == 401:
-            print(f'   🔄 Token expired — refreshing...')
-            token = get_spotify_token(client_id, client_secret)
+            elif r.status_code == 404:
+                return (row_idx, None, prev_followers, 'deleted')
 
-        elif r.status_code == 404:
-            return None, token
+            elif r.status_code == 401:
+                token = get_spotify_token(client_id, client_secret)
 
-        else:
-            print(f'   ⚠️ Status {r.status_code} for {playlist_id}')
-            return None, token
+            else:
+                return (row_idx, None, prev_followers, f'status_{r.status_code}')
 
-    return None, token
+        except Exception as e:
+            if attempt == MAX_RETRIES - 1:
+                return (row_idx, None, prev_followers, str(e))
+
+    return (row_idx, None, prev_followers, 'max_retries')
 
 
 def extract_playlist_id(url):
@@ -99,13 +106,11 @@ def find_or_create_column(sheet, today_str):
     row2 = sheet.row_values(2)
     print(f'   📊 Row 2 has {len(row2)} columns')
 
-    # Check if today already exists
     for i, h in enumerate(row2):
         if today_str in str(h):
             print(f'   📅 Today column exists at col {i+1}')
             return i + 1
 
-    # Find last non-empty column
     last_col = 0
     for i, h in enumerate(row2):
         if str(h).strip():
@@ -114,7 +119,6 @@ def find_or_create_column(sheet, today_str):
     new_col = last_col + 1
     print(f'   📅 New column at {new_col}')
 
-    # Expand columns if needed
     sheet_meta = sheet.spreadsheet.fetch_sheet_metadata()
     for s in sheet_meta['sheets']:
         if s['properties']['sheetId'] == sheet.id:
@@ -130,7 +134,6 @@ def find_or_create_column(sheet, today_str):
                 print(f'   📐 Expanded columns by 50')
             break
 
-    # Write header — no colour
     sheet.update_cell(2, new_col, today_str)
     sheet.spreadsheet.batch_update({'requests': [{'repeatCell': {
         'range': {
@@ -155,19 +158,17 @@ def process_followers_sheet(sheet, token, client_id, client_secret, today_str):
 
     col_index = find_or_create_column(sheet, today_str)
 
-    # Check if already fully tracked today
+    # Skip if already tracked today
     existing = sheet.col_values(col_index)
     already_written = sum(1 for v in existing[2:] if v)
     if already_written > 0:
-        print(f'   ⏭️  Already has {already_written} values — skipping')
+        print(f'   ⏭️  Already tracked today ({already_written} values) — skipping')
         return token
 
     print(f'   📝 Writing to column {col_index}')
 
-    # ── Fetch all followers ──
-    follower_data   = []
-    deleted_playlists = []
-
+    # Build task list
+    tasks = []
     for row_idx in range(2, len(all_values)):
         row = all_values[row_idx]
         if len(row) < 2:
@@ -181,15 +182,6 @@ def process_followers_sheet(sheet, token, client_id, client_secret, today_str):
         if not playlist_id:
             continue
 
-        followers, token = get_playlist_followers(playlist_id, token, client_id, client_secret)
-
-        if followers is None:
-            deleted_playlists.append((row_idx + 1, playlist_url))
-            continue
-
-        sheet_row = row_idx + 1
-
-        # Previous followers for colour
         prev_followers = None
         if col_index > 3:
             try:
@@ -199,27 +191,45 @@ def process_followers_sheet(sheet, token, client_id, client_secret, today_str):
             except:
                 pass
 
-        follower_data.append((sheet_row, followers, prev_followers))
+        tasks.append((playlist_id, token, client_id, client_secret, row_idx + 1, prev_followers))
 
-        if len(follower_data) % 50 == 0:
-            print(f'   ✍️  Fetched {len(follower_data)} so far...')
+    print(f'   🎯 Fetching {len(tasks)} playlists ({CONCURRENT_REQUESTS} at a time)...')
 
-    print(f'   ✅ Fetched {len(follower_data)} | Skipped {len(deleted_playlists)} (deleted/private)')
+    # Fetch concurrently
+    results = {}
+    deleted = []
+    completed = 0
 
-    if not follower_data:
+    with ThreadPoolExecutor(max_workers=CONCURRENT_REQUESTS) as executor:
+        futures = {executor.submit(fetch_single_playlist, task): task for task in tasks}
+
+        for future in as_completed(futures):
+            row_idx, followers, prev_followers, error = future.result()
+            completed += 1
+
+            if followers is not None:
+                results[row_idx] = (followers, prev_followers)
+            elif error == 'deleted':
+                deleted.append(row_idx)
+
+            if completed % 50 == 0:
+                print(f'   ✍️  {completed}/{len(tasks)} fetched...')
+
+    print(f'   ✅ Fetched {len(results)} | Deleted/private: {len(deleted)}')
+
+    if not results:
         return token
 
-    # ── Batch write all values ──
+    # Batch write values
     value_updates = []
     color_requests = []
 
-    for sheet_row, followers, prev_followers in follower_data:
+    for sheet_row, (followers, prev_followers) in sorted(results.items()):
         value_updates.append({
             'range': gspread.utils.rowcol_to_a1(sheet_row, col_index),
             'values': [[followers]]
         })
 
-        # Pure yellow/red/white matching original sheet
         if prev_followers is not None:
             if followers > prev_followers:
                 color = {'red': 1.0, 'green': 1.0, 'blue': 0.0}   # yellow
@@ -228,7 +238,7 @@ def process_followers_sheet(sheet, token, client_id, client_secret, today_str):
             else:
                 color = {'red': 1.0, 'green': 1.0, 'blue': 1.0}   # white
         else:
-            color = {'red': 1.0, 'green': 1.0, 'blue': 1.0}       # white
+            color = {'red': 1.0, 'green': 1.0, 'blue': 1.0}
 
         color_requests.append({'repeatCell': {
             'range': {
@@ -242,21 +252,11 @@ def process_followers_sheet(sheet, token, client_id, client_secret, today_str):
             'fields': 'userEnteredFormat.backgroundColor'
         }})
 
-    # Single batch write
     sheet.batch_update(value_updates)
     print(f'   ✅ Wrote {len(value_updates)} values')
 
-    # Single batch colour
     sheet.spreadsheet.batch_update({'requests': color_requests})
-    print(f'   🎨 Applied {len(color_requests)} colours')
-
-    # Log deleted playlists
-    if deleted_playlists:
-        print(f'   ⚠️  {len(deleted_playlists)} deleted/private playlists:')
-        for row, url in deleted_playlists[:5]:
-            print(f'      Row {row}: {url[:60]}')
-        if len(deleted_playlists) > 5:
-            print(f'      ... and {len(deleted_playlists) - 5} more')
+    print(f'   🎨 Applied colours')
 
     return token
 
@@ -268,26 +268,22 @@ def main():
     now = datetime.now(ist)
     today_str = now.strftime('%d %b %H:%M IST')
 
-    # Get all sheet IDs
-    all_sheet_ids = json.loads(os.environ['SHEET_IDS'])
-
-    # Get which sheets this job handles
-    sheet_indices = json.loads(os.environ['SHEET_INDICES'])
-
-    # Get this job's dedicated API key
-    all_creds = json.loads(os.environ['SPOTIFY_CREDENTIALS'])
-    key_index  = int(os.environ['KEY_INDEX'])
-    cred       = all_creds[key_index]
-    client_id     = cred['id']
-    client_secret = cred['secret']
+    all_sheet_ids  = json.loads(os.environ['SHEET_IDS'])
+    sheet_indices  = json.loads(os.environ['SHEET_INDICES'])
+    all_creds      = json.loads(os.environ['SPOTIFY_CREDENTIALS'])
+    key_index      = int(os.environ['KEY_INDEX'])
+    cred           = all_creds[key_index]
+    client_id      = cred['id']
+    client_secret  = cred['secret']
 
     my_sheets = [all_sheet_ids[i] for i in sheet_indices]
 
     print(f'''
 =======================================================
   SPOTIFY FOLLOWER TRACKER
-  Job handling sheets: {[i+1 for i in sheet_indices]}
-  Using API key: {key_index + 1}
+  Job sheets: {[i+1 for i in sheet_indices]}
+  API key: {key_index + 1}/6
+  Concurrent requests: {CONCURRENT_REQUESTS}
   Date: {today_str}
 =======================================================''')
 
@@ -327,7 +323,7 @@ def main():
     print(f'''
 =======================================================
   ✅ Job complete!
-  Sheets handled: {[i+1 for i in sheet_indices]}
+  Sheets: {[i+1 for i in sheet_indices]}
   Finished: {datetime.now(ist).strftime("%d %b %H:%M IST")}
 =======================================================''')
 

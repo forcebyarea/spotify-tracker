@@ -8,12 +8,9 @@ import pytz
 from google.oauth2.service_account import Credentials
 
 # ============================================================
-#  SPOTIFY FOLLOWER TRACKER — FULL UPDATE
-#  1. Indian time (IST)
-#  2. Correct yellow/red colours matching original sheet
-#  3. No colour formatting on new date header column
-#  4. API rotation starts from exact playlist where rate limit hit
-#  5. Smart delay to avoid rate limits with 6 keys
+#  SPOTIFY FOLLOWER TRACKER — PARALLEL VERSION
+#  Each job handles specific sheets with its own dedicated key
+#  No rotation needed — 1 key per job, 1 IP per job
 # ============================================================
 
 SCOPES = [
@@ -21,166 +18,27 @@ SCOPES = [
     'https://www.googleapis.com/auth/drive'
 ]
 
-# 6 keys, ~7885 playlists total
-# Spotify allows ~180 req/min per key
-# With 6 keys rotating = effectively 6x capacity
-# Safe delay = 1s per request (well under limit for any single key)
-DELAY_BETWEEN_REQUESTS = 2
-DELAY_BETWEEN_SHEETS   = 15
-MAX_RETRIES            = 6  # one retry per key
+MAX_RETRIES = 3
 
 
-# ── API Key Rotation ─────────────────────────────────────────
+# ── Spotify Auth ─────────────────────────────────────────────
 
-class SpotifyTokenManager:
-    def __init__(self):
-        self.credentials = self._load_credentials()
-        self.current_index = 0
-        self.tokens = {}
-        self.request_counts = [0] * len(self.credentials)
-        self.rate_limited_until = {}  # key_index -> timestamp when ban lifts
-        print(f'   🔑 Loaded {len(self.credentials)} Spotify credentials')
+def get_spotify_token(client_id, client_secret):
+    r = requests.post(
+        'https://accounts.spotify.com/api/token',
+        data={'grant_type': 'client_credentials'},
+        auth=(client_id, client_secret)
+    )
+    if r.status_code != 200:
+        raise Exception(f'Token failed: {r.text}')
+    print(f'   ✅ Token obtained')
+    return r.json().get('access_token')
 
-    def _load_credentials(self):
-        multi = os.environ.get("SPOTIFY_CREDENTIALS")
-        print(f"   🔍 SPOTIFY_CREDENTIALS present: {bool(multi)}")
-        if multi:
-            try:
-                creds = json.loads(multi)
-                if isinstance(creds, list) and len(creds) > 0:
-                    print(f"   🔍 Parsed {len(creds)} credentials from JSON")
-                    return creds
-            except:
-                pass
-        client_id     = os.environ.get('SPOTIFY_CLIENT_ID')
-        client_secret = os.environ.get('SPOTIFY_CLIENT_SECRET')
-        if client_id and client_secret:
-            return [{'id': client_id, 'secret': client_secret}]
-        raise Exception('No Spotify credentials found')
 
-    def _fetch_token(self, index):
-        cred = self.credentials[index]
-        try:
-            r = requests.post(
-                'https://accounts.spotify.com/api/token',
-                data={'grant_type': 'client_credentials'},
-                auth=(cred['id'], cred['secret'])
-            )
-            if r.status_code == 200:
-                return r.json().get('access_token')
-        except:
-            pass
-        return None
+def refresh_token_if_needed(token, client_id, client_secret):
+    return get_spotify_token(client_id, client_secret)
 
-    def _is_rate_limited(self, index):
-        if index in self.rate_limited_until:
-            remaining = self.rate_limited_until[index] - time.time()
-            if remaining > 0:
-                mins = int(remaining // 60)
-                secs = int(remaining % 60)
-                print(f'   ⏳ Key {index+1} still banned — {mins}m {secs}s remaining')
-                return True
-            else:
-                # Ban lifted
-                del self.rate_limited_until[index]
-        return False
 
-    def print_key_status(self):
-        print(f'\n   📊 API Key Status:')
-        for i in range(len(self.credentials)):
-            if i in self.rate_limited_until:
-                remaining = self.rate_limited_until[i] - time.time()
-                if remaining > 0:
-                    mins = int(remaining // 60)
-                    secs = int(remaining % 60)
-                    print(f'      Key {i+1}: 🔴 Banned — {mins}m {secs}s left')
-                else:
-                    print(f'      Key {i+1}: 🟢 Available (ban just lifted)')
-            elif i == self.current_index:
-                print(f'      Key {i+1}: 🟢 Active ({self.request_counts[i]} requests)')
-            else:
-                print(f'      Key {i+1}: 🟡 Standby ({self.request_counts[i]} requests)')
-
-    def get_token(self):
-        # Skip if current key is rate limited
-        if self._is_rate_limited(self.current_index):
-            return self._rotate()
-
-        if self.current_index not in self.tokens:
-            token = self._fetch_token(self.current_index)
-            if token:
-                self.tokens[self.current_index] = token
-                print(f'   ✅ Token from key {self.current_index + 1}/{len(self.credentials)}')
-            else:
-                return self._rotate()
-        return self.tokens.get(self.current_index)
-
-    def _rotate(self):
-        start = self.current_index
-        for offset in range(1, len(self.credentials)):
-            next_index = (start + offset) % len(self.credentials)
-
-            # Skip banned keys
-            if self._is_rate_limited(next_index):
-                continue
-
-            print(f'   🔄 Switching to key {next_index + 1}/{len(self.credentials)}...')
-            token = self._fetch_token(next_index)
-            if token:
-                self.current_index = next_index
-                self.tokens[next_index] = token
-                print(f'   ✅ Token from key {next_index + 1}/{len(self.credentials)}')
-                return token
-
-        # All keys banned — find the one with shortest remaining ban
-        self.print_key_status()
-        soonest_index = None
-        soonest_time = float('inf')
-        for idx, until in self.rate_limited_until.items():
-            remaining = until - time.time()
-            if remaining < soonest_time:
-                soonest_time = remaining
-                soonest_index = idx
-
-        if soonest_index is not None and soonest_time > 0:
-            mins = int(soonest_time // 60)
-            secs = int(soonest_time % 60)
-            print(f'   😴 All keys banned — waiting {mins}m {secs}s for key {soonest_index+1} to recover...')
-            time.sleep(soonest_time + 1)
-            del self.rate_limited_until[soonest_index]
-            if soonest_index in self.tokens:
-                del self.tokens[soonest_index]
-            self.current_index = soonest_index
-            return self.get_token()
-
-        print('   ❌ All keys exhausted')
-        return None
-
-    def handle_rate_limit(self, wait_seconds):
-        idx = self.current_index
-        ban_until = time.time() + wait_seconds
-        self.rate_limited_until[idx] = ban_until
-        mins = int(wait_seconds // 60)
-        secs = int(wait_seconds % 60)
-        print(f'   ⚡ Key {idx+1} rate limited for {mins}m {secs}s — rotating immediately')
-        if idx in self.tokens:
-            del self.tokens[idx]
-        return self._rotate()
-
-    def handle_401(self):
-        if self.current_index in self.tokens:
-            del self.tokens[self.current_index]
-        return self._rotate()
-
-    def increment(self):
-        self.request_counts[self.current_index] += 1
-        # Print status every 100 requests
-        if self.request_counts[self.current_index] % 100 == 0:
-            self.print_key_status()
-        # Proactively rotate every 200 requests
-        if self.request_counts[self.current_index] % 200 == 0:
-            print(f'   🔄 Proactive rotation after 200 requests on key {self.current_index + 1}')
-            self._rotate()
 # ── Google Sheets ────────────────────────────────────────────
 
 def get_gspread_client():
@@ -191,16 +49,11 @@ def get_gspread_client():
 
 # ── Spotify Data ─────────────────────────────────────────────
 
-def get_playlist_followers(playlist_id, token_manager):
+def get_playlist_followers(playlist_id, token, client_id, client_secret):
     url    = f'https://api.spotify.com/v1/playlists/{playlist_id}'
     params = {'fields': 'followers.total'}
 
     for attempt in range(MAX_RETRIES):
-        token = token_manager.get_token()
-        if not token:
-            print(f'   ❌ No valid token available')
-            return None
-
         r = requests.get(
             url,
             headers={'Authorization': f'Bearer {token}'},
@@ -208,30 +61,27 @@ def get_playlist_followers(playlist_id, token_manager):
         )
 
         if r.status_code == 200:
-            token_manager.increment()
-            return r.json().get('followers', {}).get('total', 0)
+            return r.json().get('followers', {}).get('total', 0), token
 
         elif r.status_code == 429:
             wait = int(r.headers.get('Retry-After', 30))
-            new_token = token_manager.handle_rate_limit(wait)
-            if not new_token:
-                # All keys rate limited — wait minimum time
-                print(f'   😴 All keys rate limited — waiting 60s...')
-                time.sleep(60)
+            mins = wait // 60
+            secs = wait % 60
+            print(f'   ⏳ Rate limited — waiting {mins}m {secs}s...')
+            time.sleep(wait)
 
         elif r.status_code == 401:
-            print(f'   🔄 401 — rotating key...')
-            token_manager.handle_401()
+            print(f'   🔄 Token expired — refreshing...')
+            token = get_spotify_token(client_id, client_secret)
 
         elif r.status_code == 404:
-            # Playlist deleted/private — skip silently
-            return None
+            return None, token
 
         else:
             print(f'   ⚠️ Status {r.status_code} for {playlist_id}')
-            return None
+            return None, token
 
-    return None
+    return None, token
 
 
 def extract_playlist_id(url):
@@ -280,45 +130,43 @@ def find_or_create_column(sheet, today_str):
                 print(f'   📐 Expanded columns by 50')
             break
 
-    # Write header — NO colour formatting on header cell
+    # Write header — no colour
     sheet.update_cell(2, new_col, today_str)
-
-    # Explicitly clear any formatting on the header cell
-    sheet.spreadsheet.batch_update({'requests': [{
-        'repeatCell': {
-            'range': {
-                'sheetId': sheet.id,
-                'startRowIndex': 1,
-                'endRowIndex': 2,
-                'startColumnIndex': new_col - 1,
-                'endColumnIndex': new_col
-            },
-            'cell': {
-                'userEnteredFormat': {
-                    'backgroundColor': {'red': 1, 'green': 1, 'blue': 1}
-                }
-            },
-            'fields': 'userEnteredFormat.backgroundColor'
-        }
-    }]})
-
-    print(f'   ✅ Header written at col {new_col} (no colour)')
+    sheet.spreadsheet.batch_update({'requests': [{'repeatCell': {
+        'range': {
+            'sheetId': sheet.id,
+            'startRowIndex': 1, 'endRowIndex': 2,
+            'startColumnIndex': new_col - 1, 'endColumnIndex': new_col
+        },
+        'cell': {'userEnteredFormat': {'backgroundColor': {'red': 1, 'green': 1, 'blue': 1}}},
+        'fields': 'userEnteredFormat.backgroundColor'
+    }}]})
+    print(f'   ✅ Header written at col {new_col}')
     return new_col
 
 
-def process_followers_sheet(sheet, token_manager, today_str):
+def process_followers_sheet(sheet, token, client_id, client_secret, today_str):
     print(f'\n   📋 Processing: {sheet.title}')
 
     all_values = sheet.get_all_values()
     if len(all_values) < 3:
         print(f'   ⚠️ Not enough rows — skipping')
-        return
+        return token
 
     col_index = find_or_create_column(sheet, today_str)
+
+    # Check if already fully tracked today
+    existing = sheet.col_values(col_index)
+    already_written = sum(1 for v in existing[2:] if v)
+    if already_written > 0:
+        print(f'   ⏭️  Already has {already_written} values — skipping')
+        return token
+
     print(f'   📝 Writing to column {col_index}')
 
-    written = 0
-    skipped = 0
+    # ── Fetch all followers ──
+    follower_data   = []
+    deleted_playlists = []
 
     for row_idx in range(2, len(all_values)):
         row = all_values[row_idx]
@@ -333,95 +181,127 @@ def process_followers_sheet(sheet, token_manager, today_str):
         if not playlist_id:
             continue
 
-        followers = get_playlist_followers(playlist_id, token_manager)
-        time.sleep(DELAY_BETWEEN_REQUESTS)
+        followers, token = get_playlist_followers(playlist_id, token, client_id, client_secret)
 
         if followers is None:
-            skipped += 1
+            deleted_playlists.append((row_idx + 1, playlist_url))
             continue
 
         sheet_row = row_idx + 1
 
-        try:
-            # Write follower count
-            sheet.update_cell(sheet_row, col_index, followers)
-            written += 1
+        # Previous followers for colour
+        prev_followers = None
+        if col_index > 3:
+            try:
+                prev_col_idx = col_index - 2
+                if len(row) > prev_col_idx and row[prev_col_idx]:
+                    prev_followers = int(str(row[prev_col_idx]).replace(',', ''))
+            except:
+                pass
 
-            # Determine colour — match original sheet style exactly
-            # Yellow (#FFFF00) = growth, Red (#FF0000) = decline, White = no change
-            prev_followers = None
-            if col_index > 3 and len(row) >= col_index - 1:
-                try:
-                    prev_val = row[col_index - 2]
-                    if prev_val:
-                        prev_followers = int(str(prev_val).replace(',', ''))
-                except:
-                    pass
+        follower_data.append((sheet_row, followers, prev_followers))
 
-            if prev_followers is not None:
-                if followers > prev_followers:
-                    # Yellow — exact match to original sheet
-                    color = {'red': 1.0, 'green': 1.0, 'blue': 0.0}
-                elif followers < prev_followers:
-                    # Red — exact match to original sheet
-                    color = {'red': 1.0, 'green': 0.0, 'blue': 0.0}
-                else:
-                    # White — no change
-                    color = {'red': 1.0, 'green': 1.0, 'blue': 1.0}
+        if len(follower_data) % 50 == 0:
+            print(f'   ✍️  Fetched {len(follower_data)} so far...')
+
+    print(f'   ✅ Fetched {len(follower_data)} | Skipped {len(deleted_playlists)} (deleted/private)')
+
+    if not follower_data:
+        return token
+
+    # ── Batch write all values ──
+    value_updates = []
+    color_requests = []
+
+    for sheet_row, followers, prev_followers in follower_data:
+        value_updates.append({
+            'range': gspread.utils.rowcol_to_a1(sheet_row, col_index),
+            'values': [[followers]]
+        })
+
+        # Pure yellow/red/white matching original sheet
+        if prev_followers is not None:
+            if followers > prev_followers:
+                color = {'red': 1.0, 'green': 1.0, 'blue': 0.0}   # yellow
+            elif followers < prev_followers:
+                color = {'red': 1.0, 'green': 0.0, 'blue': 0.0}   # red
             else:
-                # White — no previous data
-                color = {'red': 1.0, 'green': 1.0, 'blue': 1.0}
+                color = {'red': 1.0, 'green': 1.0, 'blue': 1.0}   # white
+        else:
+            color = {'red': 1.0, 'green': 1.0, 'blue': 1.0}       # white
 
-            sheet.spreadsheet.batch_update({'requests': [{'repeatCell': {
-                'range': {
-                    'sheetId': sheet.id,
-                    'startRowIndex': sheet_row - 1,
-                    'endRowIndex': sheet_row,
-                    'startColumnIndex': col_index - 1,
-                    'endColumnIndex': col_index
-                },
-                'cell': {'userEnteredFormat': {'backgroundColor': color}},
-                'fields': 'userEnteredFormat.backgroundColor'
-            }}]})
+        color_requests.append({'repeatCell': {
+            'range': {
+                'sheetId': sheet.id,
+                'startRowIndex': sheet_row - 1,
+                'endRowIndex': sheet_row,
+                'startColumnIndex': col_index - 1,
+                'endColumnIndex': col_index
+            },
+            'cell': {'userEnteredFormat': {'backgroundColor': color}},
+            'fields': 'userEnteredFormat.backgroundColor'
+        }})
 
-            if written % 10 == 0:
-                print(f'   ✍️  {written} written so far...')
+    # Single batch write
+    sheet.batch_update(value_updates)
+    print(f'   ✅ Wrote {len(value_updates)} values')
 
-        except Exception as e:
-            print(f'   ❌ Write error row {sheet_row}: {e}')
+    # Single batch colour
+    sheet.spreadsheet.batch_update({'requests': color_requests})
+    print(f'   🎨 Applied {len(color_requests)} colours')
 
-    print(f'   ✅ Done: {written} written, {skipped} skipped')
+    # Log deleted playlists
+    if deleted_playlists:
+        print(f'   ⚠️  {len(deleted_playlists)} deleted/private playlists:')
+        for row, url in deleted_playlists[:5]:
+            print(f'      Row {row}: {url[:60]}')
+        if len(deleted_playlists) > 5:
+            print(f'      ... and {len(deleted_playlists) - 5} more')
+
+    return token
 
 
 # ── Main ─────────────────────────────────────────────────────
 
 def main():
-    # 1. Indian Standard Time
     ist = pytz.timezone('Asia/Kolkata')
     now = datetime.now(ist)
     today_str = now.strftime('%d %b %H:%M IST')
 
-    sheet_ids = json.loads(os.environ['SHEET_IDS'])
+    # Get all sheet IDs
+    all_sheet_ids = json.loads(os.environ['SHEET_IDS'])
+
+    # Get which sheets this job handles
+    sheet_indices = json.loads(os.environ['SHEET_INDICES'])
+
+    # Get this job's dedicated API key
+    all_creds = json.loads(os.environ['SPOTIFY_CREDENTIALS'])
+    key_index  = int(os.environ['KEY_INDEX'])
+    cred       = all_creds[key_index]
+    client_id     = cred['id']
+    client_secret = cred['secret']
+
+    my_sheets = [all_sheet_ids[i] for i in sheet_indices]
 
     print(f'''
 =======================================================
   SPOTIFY FOLLOWER TRACKER
-  Processing all {len(sheet_ids)} sheets one by one
+  Job handling sheets: {[i+1 for i in sheet_indices]}
+  Using API key: {key_index + 1}
   Date: {today_str}
 =======================================================''')
 
-    print('🔑 Initialising Spotify credentials...')
-    token_manager = SpotifyTokenManager()
-    token_manager.get_token()
+    print('🔑 Getting Spotify token...')
+    token = get_spotify_token(client_id, client_secret)
 
     print('🔗 Connecting to Google Sheets...')
     gc = get_gspread_client()
     print('   ✅ Connected')
 
-    for i, sheet_id in enumerate(sheet_ids):
+    for i, sheet_id in zip(sheet_indices, my_sheets):
         print(f'''
 -------------------------------------------------------
-  Sheet {i+1}/{len(sheet_ids)}: {sheet_id}
+  Sheet {i+1}/17
 -------------------------------------------------------''')
         try:
             spreadsheet = gc.open_by_key(sheet_id)
@@ -435,20 +315,19 @@ def main():
 
             for sheet in follower_sheets:
                 try:
-                    process_followers_sheet(sheet, token_manager, today_str)
+                    token = process_followers_sheet(
+                        sheet, token, client_id, client_secret, today_str
+                    )
                 except Exception as e:
                     print(f'   ❌ Error on {sheet.title}: {e}')
 
         except Exception as e:
-            print(f'   ❌ Could not open sheet {sheet_id}: {e}')
-
-        if i < len(sheet_ids) - 1:
-            print(f'   ⏸️  Pausing {DELAY_BETWEEN_SHEETS}s before next sheet...')
-            time.sleep(DELAY_BETWEEN_SHEETS)
+            print(f'   ❌ Could not open sheet {i+1}: {e}')
 
     print(f'''
 =======================================================
-  ✅ All {len(sheet_ids)} sheets complete!
+  ✅ Job complete!
+  Sheets handled: {[i+1 for i in sheet_indices]}
   Finished: {datetime.now(ist).strftime("%d %b %H:%M IST")}
 =======================================================''')
 
